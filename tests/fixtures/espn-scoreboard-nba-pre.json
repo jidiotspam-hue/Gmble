@@ -1,0 +1,312 @@
+{
+ "leagues": [
+  {
+   "id": "46",
+   "uid": "s:40~l:46",
+   "name": "National Basketball Association",
+   "abbreviation": "NBA",
+   "slug": "nba"
+  }
+ ],
+ "season": {
+  "type": 2,
+  "year": 2027
+ },
+ "day": {
+  "date": "2026-10-01"
+ },
+ "events": [
+  {
+   "id": "401800001",
+   "uid": "s:40~l:46~e:401800001",
+   "date": "2026-10-01T23:30Z",
+   "name": "Boston Celtics at New York Knicks",
+   "shortName": "BOS @ NY",
+   "season": {
+    "year": 2027,
+    "type": 2,
+    "slug": "regular-season"
+   },
+   "competitions": [
+    {
+     "id": "401800001",
+     "uid": "s:40~l:46~e:401800001~c:401800001",
+     "date": "2026-10-01T23:30Z",
+     "attendance": 0,
+     "type": {
+      "id": "1",
+      "abbreviation": "STD"
+     },
+     "timeValid": true,
+     "neutralSite": false,
+     "conferenceCompetition": false,
+     "playByPlayAvailable": true,
+     "recent": false,
+     "venue": {
+      "id": "1",
+      "fullName": "Some Arena",
+      "address": {
+       "city": "Somewhere",
+       "state": "XX"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "id": "18",
+       "uid": "s:40~l:46~t:18",
+       "type": "team",
+       "order": 0,
+       "homeAway": "home",
+       "winner": false,
+       "team": {
+        "id": "18",
+        "uid": "s:40~l:46~t:18",
+        "location": "New York",
+        "name": "Knicks",
+        "abbreviation": "NY",
+        "displayName": "New York Knicks",
+        "shortDisplayName": "Knicks",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/ny.png"
+       },
+       "score": "0",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "0-0"
+        }
+       ]
+      },
+      {
+       "id": "2",
+       "uid": "s:40~l:46~t:2",
+       "type": "team",
+       "order": 1,
+       "homeAway": "away",
+       "winner": false,
+       "team": {
+        "id": "2",
+        "uid": "s:40~l:46~t:2",
+        "location": "Boston",
+        "name": "Celtics",
+        "abbreviation": "BOS",
+        "displayName": "Boston Celtics",
+        "shortDisplayName": "Celtics",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/bos.png"
+       },
+       "score": "0",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "0-0"
+        }
+       ]
+      }
+     ],
+     "notes": [],
+     "status": {
+      "clock": 0,
+      "displayClock": "0.0",
+      "period": 0,
+      "type": {
+       "id": "1",
+       "name": "STATUS_SCHEDULED",
+       "state": "pre",
+       "completed": false,
+       "description": "10/1 - 7:30 PM EDT",
+       "detail": "10/1 - 7:30 PM EDT",
+       "shortDetail": "10/1 - 7:30 PM EDT"
+      }
+     },
+     "broadcasts": [],
+     "odds": [
+      {
+       "provider": {
+        "id": "58",
+        "name": "ESPN BET",
+        "priority": 1
+       },
+       "details": "BOS -4.5",
+       "overUnder": 221.5,
+       "spread": -4.5,
+       "homeTeamOdds": {
+        "favorite": false,
+        "underdog": true,
+        "moneyLine": 155
+       },
+       "awayTeamOdds": {
+        "favorite": true,
+        "underdog": false,
+        "moneyLine": -185
+       }
+      }
+     ]
+    }
+   ],
+   "links": [],
+   "status": {
+    "clock": 0,
+    "displayClock": "0.0",
+    "period": 0,
+    "type": {
+     "id": "1",
+     "name": "STATUS_SCHEDULED",
+     "state": "pre",
+     "completed": false,
+     "description": "10/1 - 7:30 PM EDT",
+     "detail": "10/1 - 7:30 PM EDT",
+     "shortDetail": "10/1 - 7:30 PM EDT"
+    }
+   }
+  },
+  {
+   "id": "401800002",
+   "uid": "s:40~l:46~e:401800002",
+   "date": "2026-10-02T02:00Z",
+   "name": "Denver Nuggets at Los Angeles Lakers",
+   "shortName": "DEN @ LAL",
+   "season": {
+    "year": 2027,
+    "type": 2,
+    "slug": "regular-season"
+   },
+   "competitions": [
+    {
+     "id": "401800002",
+     "uid": "s:40~l:46~e:401800002~c:401800002",
+     "date": "2026-10-02T02:00Z",
+     "attendance": 0,
+     "type": {
+      "id": "1",
+      "abbreviation": "STD"
+     },
+     "timeValid": true,
+     "neutralSite": false,
+     "conferenceCompetition": false,
+     "playByPlayAvailable": true,
+     "recent": false,
+     "venue": {
+      "id": "1",
+      "fullName": "Some Arena",
+      "address": {
+       "city": "Somewhere",
+       "state": "XX"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "id": "13",
+       "uid": "s:40~l:46~t:13",
+       "type": "team",
+       "order": 0,
+       "homeAway": "home",
+       "winner": false,
+       "team": {
+        "id": "13",
+        "uid": "s:40~l:46~t:13",
+        "location": "Los Angeles",
+        "name": "Lakers",
+        "abbreviation": "LAL",
+        "displayName": "Los Angeles Lakers",
+        "shortDisplayName": "Lakers",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/lal.png"
+       },
+       "score": "0",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "0-0"
+        }
+       ]
+      },
+      {
+       "id": "7",
+       "uid": "s:40~l:46~t:7",
+       "type": "team",
+       "order": 1,
+       "homeAway": "away",
+       "winner": false,
+       "team": {
+        "id": "7",
+        "uid": "s:40~l:46~t:7",
+        "location": "Denver",
+        "name": "Nuggets",
+        "abbreviation": "DEN",
+        "displayName": "Denver Nuggets",
+        "shortDisplayName": "Nuggets",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/den.png"
+       },
+       "score": "0",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "0-0"
+        }
+       ]
+      }
+     ],
+     "notes": [],
+     "status": {
+      "clock": 0,
+      "displayClock": "0.0",
+      "period": 0,
+      "type": {
+       "id": "1",
+       "name": "STATUS_SCHEDULED",
+       "state": "pre",
+       "completed": false,
+       "description": "10/1 - 10:00 PM EDT",
+       "detail": "10/1 - 10:00 PM EDT",
+       "shortDetail": "10/1 - 10:00 PM EDT"
+      }
+     },
+     "broadcasts": []
+    }
+   ],
+   "links": [],
+   "status": {
+    "clock": 0,
+    "displayClock": "0.0",
+    "period": 0,
+    "type": {
+     "id": "1",
+     "name": "STATUS_SCHEDULED",
+     "state": "pre",
+     "completed": false,
+     "description": "10/1 - 10:00 PM EDT",
+     "detail": "10/1 - 10:00 PM EDT",
+     "shortDetail": "10/1 - 10:00 PM EDT"
+    }
+   }
+  }
+ ]
+}

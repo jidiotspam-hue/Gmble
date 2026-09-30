@@ -1,0 +1,13 @@
+{
+ "items": [
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026100100",
+   "access": "all-access",
+   "agent": "user",
+   "views": 96410
+  }
+ ]
+}

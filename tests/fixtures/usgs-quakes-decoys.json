@@ -1,0 +1,129 @@
+{
+ "type": "FeatureCollection",
+ "metadata": {
+  "count": 3,
+  "status": 200
+ },
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 6.4,
+    "place": "Just below the line",
+    "time": 1790773200000,
+    "updated": 1790776800000,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000d001",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=us7000d001&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1206,
+    "net": "us",
+    "code": "7000d001",
+    "ids": ",us7000d001,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "earthquake",
+    "title": "M 6.4 - Just below the line"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "us7000d001"
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 7,
+    "place": "Before the market opened",
+    "time": 1790769599000,
+    "updated": 1790773199000,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000d002",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=us7000d002&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1578,
+    "net": "us",
+    "code": "7000d002",
+    "ids": ",us7000d002,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "earthquake",
+    "title": "M 7 - Before the market opened"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "us7000d002"
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 6.8,
+    "place": "Quarry blast (not an earthquake)",
+    "time": 1790776800000,
+    "updated": 1790780400000,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nn00d003",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=nn00d003&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1446,
+    "net": "us",
+    "code": "nn00d003",
+    "ids": ",nn00d003,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "quarry blast",
+    "title": "M 6.8 - Quarry blast (not an earthquake)"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "nn00d003"
+  }
+ ]
+}
