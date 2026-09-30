@@ -5,51 +5,49 @@ import * as E from '../js/economy.js';
 const NOW = Date.UTC(2026, 5, 15, 12, 0, 0);
 const { DAY_MS, HOUR_MS } = E;
 
-function user(over = {}) {
-  return { ...E.newUser('u1', 'alice', NOW), ...over };
-}
-function fixedMarket(over = {}) {
-  return {
-    id: 'm1', type: 'custom', templateId: null, kind: 'choice', mode: 'fixed', title: 'T', description: '',
-    category: 'x', emoji: 'x', createdBy: 'u9', createdByName: 'bob',
-    openedAt: NOW, closesAt: NOW + HOUR_MS,
-    options: [{ id: 'a', label: 'A', odds: 2.5 }, { id: 'b', label: 'B', odds: 1.5 }],
-    optionTotals: { a: 0, b: 0 }, totalPool: 0, betCount: 0,
-    status: 'open', resolvedOptionId: null, resolvedAt: null, resolvedBy: null, eventAt: null,
-    ...over,
-  };
-}
-function poolMarket(over = {}) {
-  return fixedMarket({
-    mode: 'pool',
-    options: [{ id: 'a', label: 'A', odds: null }, { id: 'b', label: 'B', odds: null }],
-    ...over,
-  });
-}
-function timerMarket(over = {}) {
-  return {
-    ...fixedMarket({ kind: 'timer', options: E.DEFAULT_TIMER_BUCKETS.map((o) => ({ ...o })) }),
-    optionTotals: { d1: 0, d4: 0, d8: 0, never: 0 },
-    ...over,
-  };
-}
-function bet(over = {}) {
-  return {
-    id: 'b1', marketId: 'm1', marketTitle: 'T', uid: 'u1', username: 'alice', optionId: 'a', optionLabel: 'A',
-    amount: 100, odds: null, placedAt: NOW, status: 'open', payout: 0, taxed: 0, ...over,
-  };
-}
+const player = (over = {}) => ({ ...E.newPlayer('u1', 'alice', NOW), lastBetAt: 0, ...over });
 
-describe('constants and formatting', () => {
+const base = (over = {}) => E.normalizeMarket({
+  id: 'm1', type: 'custom', kind: 'choice', mode: 'pool', title: 'Will it rain?', description: '',
+  category: 'x', emoji: 'x', createdBy: 'u9', createdByName: 'bob',
+  openedAt: NOW, closesAt: NOW + HOUR_MS,
+  options: [{ id: 'a', label: 'A', odds: null }, { id: 'b', label: 'B', odds: null }],
+  ...over,
+});
+const fixedMarket = (over = {}) => base({
+  mode: 'fixed',
+  options: [{ id: 'a', label: 'A', odds: 2.5 }, { id: 'b', label: 'B', odds: 1.5 }],
+  ...over,
+});
+const timerMarket = (over = {}) => base({
+  kind: 'timer', mode: 'fixed', options: E.DEFAULT_TIMER_BUCKETS.map((o) => ({ ...o })), ...over,
+});
+const reported = (over = {}) => ({
+  ...base(), status: 'reported', reportedBy: 'u2', reportedByName: 'rep', reportedOptionId: 'a',
+  reportedAt: NOW + 2 * HOUR_MS, ...over,
+});
+const challenged = (over = {}) => ({
+  ...reported(), status: 'challenged', challengedBy: 'u3', challengedByName: 'chal',
+  challengedAt: NOW + 3 * HOUR_MS, ...over,
+});
+const bet = (over = {}) => ({
+  id: 'b1', marketId: 'm1', uid: 'u1', optionId: 'a', amount: 100, odds: null, status: 'open', payout: 0, taxed: 0, ...over,
+});
+
+describe('constants, formatting, keys', () => {
   test('constants', () => {
     assert.equal(E.STARTING_BALANCE, 500);
     assert.equal(E.RESTART_BALANCE, 100);
-    assert.equal(E.MIN_BET, 1);
-    assert.equal(E.DAY_MS, 86_400_000);
-    assert.equal(E.HOUR_MS, 3_600_000);
     assert.equal(E.PENALTY_DAYS, 3);
     assert.equal(E.PENALTY_TAX, 0.25);
-    assert.equal(E.DEFAULT_TIMER_CLOSE_HOURS, 12);
+    assert.equal(E.BOND, 20);
+    assert.equal(E.CHALLENGE_WINDOW_MS, 12 * HOUR_MS);
+    assert.equal(E.VOTE_WINDOW_MS, 24 * HOUR_MS);
+    assert.equal(E.BET_COOLDOWN_MS, 2000);
+    assert.equal(E.MAX_MARKETS_PER_DAY, 5);
+    assert.equal(E.MIN_FIXED_ODDS, 1.01);
+    assert.equal(E.MAX_FIXED_ODDS, 20);
+    assert.equal(E.CLOCK_SKEW_MS, 300000);
     assert.deepEqual(E.CURRENCY, { name: 'sonnetous', symbol: '§' });
   });
 
@@ -57,7 +55,6 @@ describe('constants and formatting', () => {
     const b = E.DEFAULT_TIMER_BUCKETS;
     assert.deepEqual(b.map((x) => x.id), ['d1', 'd4', 'd8', 'never']);
     assert.deepEqual(b.map((x) => x.odds), [6, 3, 1.8, 1.3]);
-    assert.equal(b[0].fromDays, 0);
     assert.equal(b[3].toDays, null);
   });
 
@@ -68,434 +65,572 @@ describe('constants and formatting', () => {
     assert.equal(E.formatSonnetous(1234567), '§1,234,567');
   });
 
-  test('dayKey (local) and utcDayKey', () => {
-    const ms = new Date(2026, 0, 5, 23, 30).getTime();
-    assert.equal(E.dayKey(ms), '2026-01-05');
+  test('dayKey / utcDayKey / utcDayNumber', () => {
+    assert.equal(E.dayKey(new Date(2026, 0, 5, 23, 30).getTime()), '2026-01-05');
     assert.equal(E.utcDayKey(Date.UTC(2026, 11, 31, 23, 59, 59)), '2026-12-31');
-    assert.equal(E.utcDayKey(Date.UTC(2027, 0, 1, 0, 0, 0)), '2027-01-01');
-    assert.match(E.dayKey(), /^\d{4}-\d{2}-\d{2}$/);
+    assert.equal(E.utcDayKey(Date.UTC(2027, 0, 1)), '2027-01-01');
+    assert.equal(E.utcDayNumber(0), 0);
+    assert.equal(E.utcDayNumber(DAY_MS - 1), 0);
+    assert.equal(E.utcDayNumber(DAY_MS), 1);
+    assert.equal(E.utcDayNumber(Date.UTC(2026, 5, 15, 23, 59, 59, 999)), E.utcDayNumber(Date.UTC(2026, 5, 15)));
   });
 
-  test('newUser', () => {
-    assert.deepEqual(E.newUser('u', 'n', 5), {
-      uid: 'u', username: 'n', balance: 500, createdAt: 5, bankruptcies: 0, brokeSince: null,
-      penaltyUntil: null, totalWagered: 0, totalWon: 0,
+  test('newPlayer has every v2 field', () => {
+    assert.deepEqual(E.newPlayer('u', 'n', 5), {
+      uid: 'u', username: 'n', balance: 500, openStake: 0, createdAt: 5, bankruptcies: 0, brokeSince: null,
+      penaltyUntil: null, totalWagered: 0, totalWon: 0, lastBetAt: 0, marketsDay: 0, marketsCount: 0,
+      lastClaimId: null, lastBondMarketId: null,
     });
+  });
+
+  test('validateUsername', () => {
+    assert.equal(E.validateUsername('abc'), null);
+    assert.equal(E.validateUsername('a_B_9'.padEnd(20, 'x')), null);
+    assert.ok(E.validateUsername('ab'));
+    assert.ok(E.validateUsername('a'.repeat(21)));
+    assert.ok(E.validateUsername('has space'));
+    assert.ok(E.validateUsername(null));
+  });
+
+  test('mulberry32 is deterministic in [0,1); hashString stable', () => {
+    const a = E.mulberry32(42);
+    const b = E.mulberry32(42);
+    for (let i = 0; i < 20; i++) { const v = a(); assert.equal(v, b()); assert.ok(v >= 0 && v < 1); }
+    assert.equal(E.hashString('abc'), E.hashString('abc'));
+    assert.notEqual(E.hashString('abc'), E.hashString('abd'));
   });
 });
 
-describe('market phase', () => {
-  test('isBettingOpen / marketPhase', () => {
-    const m = fixedMarket();
-    assert.equal(E.isBettingOpen(m, NOW), true);
+describe('normalizeMarket', () => {
+  test('choice pool market defaults', () => {
+    const m = base();
+    assert.deepEqual(m.optionIds, ['a', 'b']);
+    assert.equal(m.oddsById, null);
+    assert.equal(m.bucketsById, null);
+    assert.equal(m.expiresAt, null);
+    assert.equal(m.expiryOptionId, null);
+    assert.equal(m.reportableAt, m.closesAt);
+    assert.deepEqual(m.optionTotals, { a: 0, b: 0 });
+    for (const [k, v] of Object.entries({
+      totalPool: 0, betCount: 0, lastBetId: null, status: 'open', reportedBy: null, reportedByName: null,
+      reportedOptionId: null, reportedEventAt: null, reportedAt: null, evidence: null, challengedBy: null,
+      challengedByName: null, challengedAt: null, votesUphold: 0, votesOverturn: 0, lastVoteId: null,
+      resolvedOptionId: null, resolvedAt: null, eventAt: null, reporterBondPaid: false, challengerBondPaid: false,
+      oracle: null, templateId: null,
+    })) assert.deepEqual(m[k], v, k);
+    assert.ok(!('resolvedBy' in m));
+  });
+
+  test('fixed market gets oddsById', () => {
+    assert.deepEqual(fixedMarket().oddsById, { a: 2.5, b: 1.5 });
+  });
+
+  test('timer market derives buckets, expiry and reportableAt', () => {
+    const m = timerMarket();
+    assert.deepEqual(m.bucketsById, {
+      d1: { fromMs: 0, toMs: DAY_MS },
+      d4: { fromMs: DAY_MS, toMs: 4 * DAY_MS },
+      d8: { fromMs: 4 * DAY_MS, toMs: 8 * DAY_MS },
+      never: { fromMs: 8 * DAY_MS, toMs: null },
+    });
+    assert.equal(m.expiresAt, NOW + 8 * DAY_MS);
+    assert.equal(m.expiryOptionId, 'never');
+    assert.equal(m.reportableAt, NOW);
+    assert.deepEqual(m.oddsById, { d1: 6, d4: 3, d8: 1.8, never: 1.3 });
+  });
+
+  test('timer without an open-ended bucket never expires', () => {
+    const m = timerMarket({ options: [{ id: 'x', label: 'x', odds: 2, fromDays: 0, toDays: 1 }, { id: 'y', label: 'y', odds: 2, fromDays: 1, toDays: 2 }] });
+    assert.equal(m.expiresAt, null);
+    assert.equal(m.expiryOptionId, null);
+  });
+
+  test('oracle.params.at drives reportableAt for choice markets', () => {
+    const m = base({ oracle: { type: 'price_above', params: { at: NOW + 5 * HOUR_MS }, source: 's', label: 'l' } });
+    assert.equal(m.reportableAt, NOW + 5 * HOUR_MS);
+  });
+
+  test('never overwrites present fields and does not mutate input', () => {
+    const input = { ...base(), reportableAt: 123, totalPool: 77, optionTotals: { a: 70, b: 7 } };
+    const frozenOptions = JSON.stringify(input.options);
+    const out = E.normalizeMarket(input);
+    assert.equal(out.reportableAt, 123);
+    assert.equal(out.totalPool, 77);
+    assert.notEqual(out.options, input.options);
+    assert.equal(JSON.stringify(input.options), frozenOptions);
+    assert.deepEqual(E.normalizeMarket(out), out);
+  });
+});
+
+describe('marketPhase / isBettingOpen', () => {
+  test('open, closed at exactly closesAt, and passthrough statuses', () => {
+    const m = base();
+    assert.equal(E.marketPhase(m, m.closesAt - 1), 'open');
+    assert.equal(E.marketPhase(m, m.closesAt), 'closed');
     assert.equal(E.isBettingOpen(m, m.closesAt - 1), true);
     assert.equal(E.isBettingOpen(m, m.closesAt), false);
-    assert.equal(E.marketPhase(m, NOW), 'open');
-    assert.equal(E.marketPhase(m, m.closesAt), 'awaiting');
-    assert.equal(E.marketPhase({ ...m, status: 'resolved' }, NOW), 'resolved');
-    assert.equal(E.marketPhase({ ...m, status: 'void' }, m.closesAt + 1), 'void');
-    assert.equal(E.isBettingOpen({ ...m, status: 'resolved' }, NOW), false);
+    for (const s of ['reported', 'challenged', 'resolved', 'void']) {
+      assert.equal(E.marketPhase({ ...m, status: s }, NOW), s);
+      assert.equal(E.isBettingOpen({ ...m, status: s }, NOW), false);
+    }
   });
 });
 
 describe('validateBet', () => {
   const m = fixedMarket();
-  test('valid bet', () => {
-    assert.equal(E.validateBet(user(), m, 'a', 100, NOW), null);
-    assert.equal(E.validateBet(user(), m, 'a', 500, NOW), null);
-    assert.equal(E.validateBet(user(), m, 'a', 1, NOW), null);
+  test('accepts a good bet', () => assert.equal(E.validateBet(player(), m, 'a', 50, NOW), null));
+  test('friendly errors', () => {
+    assert.match(E.validateBet(null, m, 'a', 5, NOW), /log in/i);
+    assert.match(E.validateBet(player(), null, 'a', 5, NOW), /not found/i);
+    assert.match(E.validateBet(player(), { ...m, status: 'resolved' }, 'a', 5, NOW), /resolved/);
+    assert.match(E.validateBet(player(), { ...m, status: 'void' }, 'a', 5, NOW), /voided/);
+    assert.match(E.validateBet(player(), { ...m, status: 'reported' }, 'a', 5, NOW), /closed/i);
+    assert.match(E.validateBet(player(), { ...m, status: 'challenged' }, 'a', 5, NOW), /closed/i);
+    assert.match(E.validateBet(player(), m, 'a', 5, m.closesAt), /closed/i);
+    assert.equal(E.validateBet(player(), m, 'a', 5, m.closesAt - 1), null);
+    assert.match(E.validateBet(player(), m, 'zzz', 5, NOW), /unknown option/i);
+    assert.match(E.validateBet(player(), m, 'a', 1.5, NOW), /whole number/);
+    assert.match(E.validateBet(player(), m, 'a', NaN, NOW), /whole number/);
+    assert.match(E.validateBet(player(), m, 'a', '5', NOW), /whole number/);
+    assert.match(E.validateBet(player(), m, 'a', 0, NOW), /minimum/i);
+    assert.match(E.validateBet(player(), m, 'a', -3, NOW), /minimum/i);
+    assert.equal(E.validateBet(player(), m, 'a', 500, NOW), null);
+    assert.equal(E.validateBet(player(), m, 'a', 501, NOW), 'Not enough sonnetous');
   });
-  test('null user', () => {
-    assert.equal(typeof E.validateBet(null, m, 'a', 10, NOW), 'string');
-  });
-  test('closed market', () => {
-    assert.match(E.validateBet(user(), m, 'a', 10, m.closesAt), /closed/i);
-    assert.match(E.validateBet(user(), m, 'a', 10, m.closesAt + DAY_MS), /closed/i);
-  });
-  test('resolved / void market', () => {
-    assert.match(E.validateBet(user(), { ...m, status: 'resolved' }, 'a', 10, NOW), /resolved/i);
-    assert.match(E.validateBet(user(), { ...m, status: 'void' }, 'a', 10, NOW), /void/i);
-  });
-  test('insufficient balance', () => {
-    assert.equal(E.validateBet(user(), m, 'a', 501, NOW), 'Not enough sonnetous');
-    assert.equal(E.validateBet(user({ balance: 0 }), m, 'a', 1, NOW), 'Not enough sonnetous');
-  });
-  test('bad amounts', () => {
-    for (const bad of [0, -5, 1.5, NaN, Infinity, '10', null, undefined]) {
-      assert.equal(typeof E.validateBet(user(), m, 'a', bad, NOW), 'string', `amount ${String(bad)}`);
-    }
-  });
-  test('unknown option', () => {
-    assert.match(E.validateBet(user(), m, 'zzz', 10, NOW), /option/i);
-    assert.equal(typeof E.validateBet(user(), m, undefined, 10, NOW), 'string');
+  test('cooldown: exactly 2s after the last bet is fine', () => {
+    const p = player({ lastBetAt: NOW });
+    assert.equal(E.validateBet(p, m, 'a', 5, NOW), 'Slow down — one bet every 2 seconds');
+    assert.equal(E.validateBet(p, m, 'a', 5, NOW + 1999), 'Slow down — one bet every 2 seconds');
+    assert.equal(E.validateBet(p, m, 'a', 5, NOW + 2000), null);
   });
 });
 
-describe('payout math', () => {
-  test('fixed potentialPayout floors', () => {
+describe('potentialPayout / displayOdds / buildBet / applyBetToMarket', () => {
+  test('fixed', () => {
     const m = fixedMarket();
     assert.equal(E.potentialPayout(m, 'a', 100), 250);
-    assert.equal(E.potentialPayout(m, 'a', 3), 7); // 7.5
-    assert.equal(E.potentialPayout(m, 'b', 1), 1); // 1.5
-    assert.equal(E.potentialPayout(fixedMarket({ options: [{ id: 'a', label: 'A', odds: 1.15 }] }), 'a', 100), 115);
+    assert.equal(E.potentialPayout(m, 'b', 33), 49);
+    assert.equal(E.potentialPayout(m, 'a', 0), 0);
+    assert.equal(E.potentialPayout(m, 'nope', 10), 0);
+    assert.equal(E.potentialPayout(fixedMarket({ options: [{ id: 'a', label: 'A', odds: 1.15 }, { id: 'b', label: 'B', odds: 2 }] }), 'a', 100), 115);
+    assert.equal(E.displayOdds(m, 'a'), 2.5);
   });
-  test('pool potentialPayout', () => {
-    const m = poolMarket({ optionTotals: { a: 100, b: 300 }, totalPool: 400 });
-    // stake 100 on a: 100*(500)/(200) = 250
-    assert.equal(E.potentialPayout(m, 'a', 100), 250);
-    // empty option: sole winner takes the pool
-    const empty = poolMarket({ optionTotals: { a: 0, b: 300 }, totalPool: 300 });
-    assert.equal(E.potentialPayout(empty, 'a', 50), 350);
-    assert.equal(E.potentialPayout(poolMarket(), 'a', 10), 10);
-  });
-  test('displayOdds', () => {
-    assert.equal(E.displayOdds(fixedMarket(), 'a'), 2.5);
-    const m = poolMarket({ optionTotals: { a: 100, b: 300 }, totalPool: 400 });
+  test('pool', () => {
+    const m = base({ optionTotals: { a: 100, b: 300 }, totalPool: 400 });
+    assert.equal(E.potentialPayout(m, 'a', 100), Math.floor(100 * 500 / 200));
+    assert.equal(E.potentialPayout(m, 'b', 100), Math.floor(100 * 500 / 400));
     assert.equal(E.displayOdds(m, 'a'), 4);
-    assert.equal(E.displayOdds(m, 'b'), 400 / 300);
-    assert.equal(E.displayOdds(poolMarket(), 'a'), null);
+    assert.equal(E.displayOdds(base(), 'a'), null);
+    assert.equal(E.potentialPayout(base(), 'a', 10), 10);
   });
-});
-
-describe('buildBet and applyBetToMarket', () => {
-  test('fixed bet locks odds', () => {
-    const m = fixedMarket();
-    const b = E.buildBet({ id: 'x', market: m, user: user(), optionId: 'a', amount: 40, now: NOW });
+  test('buildBet locks odds for fixed, null for pool; carries claimedAt null', () => {
+    const b = E.buildBet({ id: 'x', market: fixedMarket(), player: player(), optionId: 'b', amount: 10, now: NOW });
     assert.deepEqual(b, {
-      id: 'x', marketId: 'm1', marketTitle: 'T', uid: 'u1', username: 'alice', optionId: 'a', optionLabel: 'A',
-      amount: 40, odds: 2.5, placedAt: NOW, status: 'open', payout: 0, taxed: 0,
+      id: 'x', marketId: 'm1', marketTitle: 'Will it rain?', uid: 'u1', username: 'alice', optionId: 'b', optionLabel: 'B',
+      amount: 10, odds: 1.5, placedAt: NOW, status: 'open', payout: 0, taxed: 0, claimedAt: null,
     });
+    assert.equal(E.buildBet({ id: 'x', market: base(), player: player(), optionId: 'a', amount: 10, now: NOW }).odds, null);
   });
-  test('pool bet has null odds', () => {
-    const b = E.buildBet({ id: 'x', market: poolMarket(), user: user(), optionId: 'b', amount: 5, now: NOW });
-    assert.equal(b.odds, null);
-    assert.equal(b.optionLabel, 'B');
-  });
-  test('applyBetToMarket does not mutate', () => {
-    const m = fixedMarket({ optionTotals: { a: 10, b: 0 }, totalPool: 10, betCount: 1 });
-    const frozen = JSON.stringify(m);
-    const patch = E.applyBetToMarket(m, 'a', 25);
-    assert.deepEqual(patch, { optionTotals: { a: 35, b: 0 }, totalPool: 35, betCount: 2 });
-    assert.equal(JSON.stringify(m), frozen);
-    assert.deepEqual(E.applyBetToMarket(m, 'b', 5).optionTotals, { a: 10, b: 5 });
+  test('applyBetToMarket is a pure patch', () => {
+    const m = base({ optionTotals: { a: 5, b: 0 }, totalPool: 5, betCount: 1 });
+    const patch = E.applyBetToMarket(m, 'a', 10, 'bet9');
+    assert.deepEqual(patch, { optionTotals: { a: 15, b: 0 }, totalPool: 15, betCount: 2, lastBetId: 'bet9' });
+    assert.deepEqual(m.optionTotals, { a: 5, b: 0 });
   });
 });
 
-describe('timer buckets', () => {
+describe('validateCreateMarket / marketCreationPatch', () => {
+  const custom = (over = {}) => base({ createdBy: 'u1', createdByName: 'alice', ...over });
+  test('valid custom', () => assert.equal(E.validateCreateMarket(player(), custom(), NOW), null));
+  test('daily cap of 5 resets at UTC midnight', () => {
+    const today = E.utcDayNumber(NOW);
+    assert.equal(E.validateCreateMarket(player({ marketsDay: today, marketsCount: 4 }), custom(), NOW), null);
+    assert.equal(E.validateCreateMarket(player({ marketsDay: today, marketsCount: 5 }), custom(), NOW),
+      'You can only create 5 markets per day');
+    assert.equal(E.validateCreateMarket(player({ marketsDay: today - 1, marketsCount: 5 }), custom(), NOW), null);
+    // the last ms of the day still counts, the first ms of the next day resets
+    const endOfDay = (today + 1) * DAY_MS - 1;
+    const p = player({ marketsDay: today, marketsCount: 5 });
+    const m = (t) => custom({ openedAt: t, closesAt: t + HOUR_MS, reportableAt: t + HOUR_MS });
+    assert.match(E.validateCreateMarket(p, m(endOfDay), endOfDay), /5 markets/);
+    assert.equal(E.validateCreateMarket(p, m(endOfDay + 1), endOfDay + 1), null);
+  });
+  test('marketCreationPatch increments or resets', () => {
+    const today = E.utcDayNumber(NOW);
+    assert.deepEqual(E.marketCreationPatch(player(), NOW), { marketsDay: today, marketsCount: 1 });
+    assert.deepEqual(E.marketCreationPatch(player({ marketsDay: today, marketsCount: 3 }), NOW), { marketsDay: today, marketsCount: 4 });
+    assert.deepEqual(E.marketCreationPatch(player({ marketsDay: today - 2, marketsCount: 5 }), NOW), { marketsDay: today, marketsCount: 1 });
+  });
+  test('structural errors', () => {
+    assert.match(E.validateCreateMarket(null, custom(), NOW), /log in/i);
+    assert.match(E.validateCreateMarket(player(), custom({ createdBy: 'u2' }), NOW), /as yourself/);
+    assert.match(E.validateCreateMarket(player(), custom({ title: 'hi' }), NOW), /at least 3/);
+    assert.match(E.validateCreateMarket(player(), custom({ title: 'x'.repeat(141) }), NOW), /at most 140/);
+    assert.match(E.validateCreateMarket(player(), custom({ options: [{ id: 'a', label: 'A', odds: null }] }), NOW), /2–6/);
+    assert.match(E.validateCreateMarket(player(), custom({ closesAt: NOW }), NOW), /future/);
+    assert.match(E.validateCreateMarket(player(), custom({ openedAt: NOW + E.CLOCK_SKEW_MS + 1 }), NOW), /clock/i);
+    assert.equal(E.validateCreateMarket(player(), custom({ openedAt: NOW + E.CLOCK_SKEW_MS, closesAt: NOW + HOUR_MS }), NOW), null);
+    assert.match(E.validateCreateMarket(player(), custom({ totalPool: 5 }), NOW), /empty pool/);
+    assert.match(E.validateCreateMarket(player(), custom({ status: 'resolved' }), NOW), /open/);
+  });
+  test('fixed odds bounds [1.01, 20]', () => {
+    const fm = (odds) => fixedMarket({ createdBy: 'u1', createdByName: 'alice', kind: 'choice', options: [{ id: 'a', label: 'A', odds }, { id: 'b', label: 'B', odds: 2 }] });
+    const hm = (odds) => ({ ...fm(odds), type: 'auto', createdBy: 'house', id: 'auto-2026-06-15-x' });
+    assert.equal(E.validateCreateMarket(player(), hm(1.01), NOW), null);
+    assert.equal(E.validateCreateMarket(player(), hm(20), NOW), null);
+    assert.match(E.validateCreateMarket(player(), hm(1.0), NOW), /between 1.01 and 20/);
+    assert.match(E.validateCreateMarket(player(), hm(20.01), NOW), /between 1.01 and 20/);
+    assert.match(E.validateCreateMarket(player(), hm(null), NOW), /between/);
+  });
+  test('house markets: id format, no daily cap, must be createdBy house + auto', () => {
+    const house = (over = {}) => ({ ...fixedMarket({ kind: 'choice' }), id: 'auto-2026-06-15-tpl', type: 'auto', createdBy: 'house', ...over });
+    const capped = player({ marketsDay: E.utcDayNumber(NOW), marketsCount: 5 });
+    assert.equal(E.validateCreateMarket(capped, house(), NOW), null);
+    assert.match(E.validateCreateMarket(capped, house({ id: 'nope' }), NOW), /house market id/);
+    assert.match(E.validateCreateMarket(capped, house({ type: 'custom' }), NOW), /Invalid/);
+  });
+  test('custom timer must be fixed, custom choice must be pool', () => {
+    assert.match(E.validateCreateMarket(player(), custom({ mode: 'fixed', oddsById: { a: 2, b: 2 } }), NOW), /pool/);
+    const t = timerMarket({ createdBy: 'u1', createdByName: 'alice' });
+    assert.equal(E.validateCreateMarket(player(), t, NOW), null);
+    assert.match(E.validateCreateMarket(player(), { ...t, mode: 'pool' }, NOW), /fixed/);
+  });
+});
+
+describe('timer helpers', () => {
   const m = timerMarket();
-  const at = (days) => NOW + days * DAY_MS;
-  test('boundaries', () => {
-    assert.equal(E.timerBucketFor(m, at(0)), 'd1');
-    assert.equal(E.timerBucketFor(m, at(1) - 1), 'd1');
-    assert.equal(E.timerBucketFor(m, at(1)), 'd4');
-    assert.equal(E.timerBucketFor(m, at(4) - 1), 'd4');
-    assert.equal(E.timerBucketFor(m, at(4)), 'd8');
-    assert.equal(E.timerBucketFor(m, at(8) - 1), 'd8');
-    assert.equal(E.timerBucketFor(m, at(8)), 'never');
-    assert.equal(E.timerBucketFor(m, at(400)), 'never');
+  test('timerBucketFor edges', () => {
+    assert.equal(E.timerBucketFor(m, NOW), 'd1');
+    assert.equal(E.timerBucketFor(m, NOW - 5), 'd1');
+    assert.equal(E.timerBucketFor(m, NOW + DAY_MS - 1), 'd1');
+    assert.equal(E.timerBucketFor(m, NOW + DAY_MS), 'd4');
+    assert.equal(E.timerBucketFor(m, NOW + 4 * DAY_MS), 'd8');
+    assert.equal(E.timerBucketFor(m, NOW + 8 * DAY_MS), 'never');
+    assert.equal(E.timerBucketFor(m, NOW + 100 * DAY_MS), 'never');
   });
-  test('event before openedAt maps to first bucket', () => {
-    assert.equal(E.timerBucketFor(m, NOW - 5 * DAY_MS), 'd1');
-  });
-  test('fractional (hours-scale) buckets', () => {
-    const fast = timerMarket({
-      options: [
-        { id: 'h6', label: 'Within 6 hours', odds: 7, fromDays: 0, toDays: 0.25 },
-        { id: 'd1', label: '6h-1d', odds: 3, fromDays: 0.25, toDays: 1 },
-        { id: 'never', label: '1+ d', odds: 1.3, fromDays: 1, toDays: null },
-      ],
-    });
-    assert.equal(E.timerBucketFor(fast, NOW + 5 * HOUR_MS), 'h6');
-    assert.equal(E.timerBucketFor(fast, NOW + 6 * HOUR_MS), 'd1');
-    assert.equal(E.timerBucketFor(fast, NOW + 24 * HOUR_MS), 'never');
-  });
-  test('timerAutoResolution', () => {
-    assert.equal(E.timerAutoResolution(m, NOW), null);
-    assert.equal(E.timerAutoResolution(m, at(8) - 1), null);
-    assert.equal(E.timerAutoResolution(m, at(8)), 'never');
-    assert.equal(E.timerAutoResolution(m, at(30)), 'never');
-    assert.equal(E.timerAutoResolution({ ...m, status: 'resolved' }, at(30)), null);
-    assert.equal(E.timerAutoResolution(fixedMarket(), at(30)), null); // choice market
-  });
-  test('timerAutoResolution respects custom bucket sets', () => {
-    const q = timerMarket({
-      options: [
-        { id: 'h6', label: 'a', odds: 7, fromDays: 0, toDays: 0.25 },
-        { id: 'never', label: 'b', odds: 1.3, fromDays: 0.25, toDays: null },
-      ],
-    });
-    assert.equal(E.timerAutoResolution(q, NOW + 5 * HOUR_MS), null);
-    assert.equal(E.timerAutoResolution(q, NOW + 6 * HOUR_MS), 'never');
+  test('timerAutoResolution boundary', () => {
+    assert.equal(E.timerAutoResolution(m, NOW + 8 * DAY_MS - 1), null);
+    assert.equal(E.timerAutoResolution(m, NOW + 8 * DAY_MS), 'never');
+    assert.equal(E.timerAutoResolution({ ...m, status: 'reported' }, NOW + 9 * DAY_MS), null);
+    assert.equal(E.timerAutoResolution(base(), NOW + 99 * DAY_MS), null);
   });
 });
 
-describe('settleMarket (fixed)', () => {
-  const m = fixedMarket();
-  test('winners paid floor(stake*odds), losers zeroed, only open bets touched', () => {
-    const bets = [
-      bet({ id: 'w', uid: 'u1', optionId: 'a', amount: 3, odds: 2.5 }),
-      bet({ id: 'l', uid: 'u2', optionId: 'b', amount: 50, odds: 1.5 }),
-      bet({ id: 'old', uid: 'u3', optionId: 'a', amount: 10, odds: 2.5, status: 'lost' }),
-      bet({ id: 'other', marketId: 'zzz', uid: 'u4', optionId: 'a', amount: 10, odds: 2.5 }),
-    ];
-    const users = { u1: user(), u2: user({ uid: 'u2' }) };
-    const before = JSON.stringify([m, bets, users]);
-    const r = E.settleMarket(m, bets, 'a', users, NOW + 1000, 'alice', NOW + 500);
-    assert.deepEqual(r.marketPatch, {
-      status: 'resolved', resolvedOptionId: 'a', resolvedAt: NOW + 1000, resolvedBy: 'alice', eventAt: NOW + 500,
-    });
-    assert.deepEqual(r.betPatches, {
-      w: { status: 'won', payout: 7, taxed: 0 }, // floor(7.5)
-      l: { status: 'lost', payout: 0, taxed: 0 },
-    });
-    assert.deepEqual(r.userDeltas, { u1: { balance: 7, totalWon: 7 } });
-    assert.equal(JSON.stringify([m, bets, users]), before, 'inputs not mutated');
+describe('validateReport', () => {
+  const closedChoice = base({ createdBy: 'u1' });
+  const at = closedChoice.closesAt;
+  test('creator-only on custom markets', () => {
+    assert.equal(E.validateReport(player(), closedChoice, 'a', null, at), null);
+    assert.equal(E.validateReport(player({ uid: 'u5' }), closedChoice, 'a', null, at), 'Only the creator can report this market');
   });
-  test('eventAt defaults to null; multiple winning bets by one user are summed', () => {
-    const bets = [
-      bet({ id: 'a1', amount: 10, odds: 2 }),
-      bet({ id: 'a2', amount: 20, odds: 3 }),
-    ];
-    const r = E.settleMarket(m, bets, 'a', {}, NOW, 'auto');
-    assert.equal(r.marketPatch.eventAt, null);
-    assert.deepEqual(r.userDeltas, { u1: { balance: 80, totalWon: 80 } });
+  test('anyone may report house markets', () => {
+    const h = { ...closedChoice, type: 'auto', createdBy: 'house' };
+    assert.equal(E.validateReport(player({ uid: 'u5' }), h, 'a', null, at), null);
   });
-  test('no winners: nobody in userDeltas', () => {
-    const r = E.settleMarket(m, [bet({ optionId: 'b', odds: 1.5 })], 'a', {}, NOW, 'x');
-    assert.deepEqual(r.userDeltas, {});
-    assert.equal(r.marketPatch.status, 'resolved');
+  test('reportableAt boundary', () => {
+    assert.match(E.validateReport(player(), closedChoice, 'a', null, at - 1), /too early/i);
+    assert.equal(E.validateReport(player(), closedChoice, 'a', null, at), null);
   });
-  test('unknown winning option throws', () => {
-    assert.throws(() => E.settleMarket(m, [], 'nope', {}, NOW, 'x'), /option/i);
+  test('status errors', () => {
+    const p = player();
+    assert.match(E.validateReport(p, { ...closedChoice, status: 'reported' }, 'a', null, at), /already been reported/);
+    assert.match(E.validateReport(p, { ...closedChoice, status: 'challenged' }, 'a', null, at), /already been reported/);
+    assert.match(E.validateReport(p, { ...closedChoice, status: 'resolved' }, 'a', null, at), /resolved/);
+    assert.match(E.validateReport(p, { ...closedChoice, status: 'void' }, 'a', null, at), /voided/);
+    assert.match(E.validateReport(null, closedChoice, 'a', null, at), /log in/i);
+    assert.match(E.validateReport(p, null, 'a', null, at), /not found/i);
+    assert.match(E.validateReport(p, closedChoice, 'zz', null, at), /unknown option/i);
+  });
+  test('bond required', () => {
+    assert.match(E.validateReport(player({ balance: 19 }), closedChoice, 'a', null, at), /Not enough sonnetous/);
+    assert.equal(E.validateReport(player({ balance: 20 }), closedChoice, 'a', null, at), null);
+  });
+  test('timer: eventAt window and bucket', () => {
+    const t = timerMarket({ createdBy: 'u1' });
+    const now = NOW + 3 * DAY_MS;
+    const p = player();
+    assert.equal(E.validateReport(p, t, 'd4', NOW + 2 * DAY_MS, now), null);
+    assert.equal(E.validateReport(p, t, 'd4', NOW + DAY_MS, now), null);           // lower edge inclusive
+    assert.match(E.validateReport(p, t, 'd1', NOW + DAY_MS, now), /doesn't fit/);  // upper edge exclusive
+    assert.equal(E.validateReport(p, t, 'd1', NOW + DAY_MS - 1, now), null);
+    assert.match(E.validateReport(p, t, 'd4', NOW - 1, now), /before the market opened/);
+    assert.equal(E.validateReport(p, t, 'd1', NOW, now), null);                    // eventAt == openedAt
+    assert.match(E.validateReport(p, t, 'd4', now + 1, now), /future/);
+    assert.equal(E.validateReport(p, t, 'd4', now, now), null);                    // eventAt == now
+    assert.match(E.validateReport(p, t, 'd4', null, now), /when it happened/);
+    assert.match(E.validateReport(p, t, 'd4', NaN, now), /when it happened/);
+    // reportable immediately after opening (before betting closes)
+    assert.equal(E.validateReport(p, t, 'd1', NOW, NOW), null);
+    // open-ended bucket
+    assert.equal(E.validateReport(p, t, 'never', NOW + 9 * DAY_MS, NOW + 10 * DAY_MS), null);
   });
 });
 
-describe('bankruptcy tax', () => {
-  const m = fixedMarket();
-  const b = bet({ amount: 100, odds: 2.5 }); // payout 250, profit 150, tax floor(37.5)=37
-  test('taxed only on profit while penalty active', () => {
-    const u = user({ penaltyUntil: NOW + 1000 });
-    const r = E.settleMarket(m, [b], 'a', { u1: u }, NOW, 'x');
-    assert.deepEqual(r.betPatches.b1, { status: 'won', payout: 213, taxed: 37 });
-    assert.deepEqual(r.userDeltas.u1, { balance: 213, totalWon: 213 });
+describe('validateChallenge', () => {
+  const m = reported();
+  const p = player({ uid: 'u3' });
+  test('window boundary is exclusive at reportedAt + 12h', () => {
+    assert.equal(E.validateChallenge(p, m, m.reportedAt + E.CHALLENGE_WINDOW_MS - 1), null);
+    assert.equal(E.validateChallenge(p, m, m.reportedAt + E.CHALLENGE_WINDOW_MS), 'The challenge window has closed');
   });
-  test('no tax when penalty expired (boundary) or absent', () => {
-    for (const penaltyUntil of [NOW, NOW - 1, null]) {
-      const r = E.settleMarket(m, [b], 'a', { u1: user({ penaltyUntil }) }, NOW, 'x');
-      assert.deepEqual(r.betPatches.b1, { status: 'won', payout: 250, taxed: 0 }, String(penaltyUntil));
+  test('errors', () => {
+    const t = m.reportedAt + 1;
+    assert.match(E.validateChallenge(null, m, t), /log in/i);
+    assert.match(E.validateChallenge(p, null, t), /not found/i);
+    assert.match(E.validateChallenge(p, base(), t), /no reported result/);
+    assert.match(E.validateChallenge(p, challenged(), t), /already been challenged/);
+    assert.match(E.validateChallenge(player({ uid: 'u2' }), m, t), /own report/);
+    assert.match(E.validateChallenge(player({ uid: 'u3', balance: 19 }), m, t), /Not enough sonnetous/);
+    assert.equal(E.validateChallenge(player({ uid: 'u3', balance: 20 }), m, t), null);
+  });
+});
+
+describe('validateVote', () => {
+  const m = challenged();
+  const p = player({ uid: 'u4' });
+  const ok = { hasStake: false, hasVoted: false };
+  test('window boundary is exclusive at challengedAt + 24h', () => {
+    assert.equal(E.validateVote(p, m, ok, m.challengedAt + E.VOTE_WINDOW_MS - 1), null);
+    assert.equal(E.validateVote(p, m, ok, m.challengedAt + E.VOTE_WINDOW_MS), 'The voting window has closed');
+  });
+  test('eligibility', () => {
+    const t = m.challengedAt + 1;
+    assert.equal(E.validateVote(p, m, { hasStake: true, hasVoted: false }, t), "You bet on this market, so you can't vote");
+    assert.match(E.validateVote(p, m, { hasStake: false, hasVoted: true }, t), /already voted/);
+    assert.match(E.validateVote(player({ uid: 'u2' }), m, ok, t), /can't vote/);
+    assert.match(E.validateVote(player({ uid: 'u3' }), m, ok, t), /can't vote/);
+    assert.match(E.validateVote(p, reported(), ok, t), /not under dispute/);
+    assert.match(E.validateVote(null, m, ok, t), /log in/i);
+    assert.match(E.validateVote(p, null, ok, t), /not found/i);
+  });
+});
+
+describe('finalizeOutcome', () => {
+  test('nothing to do for open non-expired and final markets', () => {
+    assert.equal(E.finalizeOutcome(base(), NOW + 99 * DAY_MS), null);
+    assert.equal(E.finalizeOutcome({ ...base(), status: 'resolved' }, NOW + 99 * DAY_MS), null);
+    assert.equal(E.finalizeOutcome({ ...base(), status: 'void' }, NOW + 99 * DAY_MS), null);
+    assert.equal(E.finalizeOutcome(null, NOW), null);
+  });
+  test('timer expiry at exactly expiresAt', () => {
+    const t = timerMarket();
+    assert.equal(E.finalizeOutcome(t, t.expiresAt - 1), null);
+    assert.deepEqual(E.finalizeOutcome(t, t.expiresAt), { status: 'resolved', resolvedOptionId: 'never', eventAt: null });
+  });
+  test('unchallenged report finalizes at reportedAt + 12h (choice, fixed)', () => {
+    const m = reported({ mode: 'fixed' });
+    assert.equal(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS - 1), null);
+    assert.deepEqual(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS),
+      { status: 'resolved', resolvedOptionId: 'a', eventAt: null });
+  });
+  test('reported timer keeps the reported eventAt', () => {
+    const m = { ...timerMarket(), status: 'reported', reportedOptionId: 'd4', reportedEventAt: NOW + 2 * DAY_MS, reportedAt: NOW + 3 * DAY_MS };
+    assert.deepEqual(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS),
+      { status: 'resolved', resolvedOptionId: 'd4', eventAt: NOW + 2 * DAY_MS });
+  });
+  test('pool with no stake on the reported option is void', () => {
+    const m = reported({ optionTotals: { a: 0, b: 50 }, totalPool: 50 });
+    assert.deepEqual(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS), { status: 'void', resolvedOptionId: null, eventAt: null });
+    const ok = reported({ optionTotals: { a: 1, b: 50 }, totalPool: 51 });
+    assert.equal(E.finalizeOutcome(ok, ok.reportedAt + E.CHALLENGE_WINDOW_MS).status, 'resolved');
+  });
+  test('challenged: uphold > overturn resolves, otherwise void, only after 24h', () => {
+    const at = (m) => m.challengedAt + E.VOTE_WINDOW_MS;
+    const up = challenged({ votesUphold: 2, votesOverturn: 1, optionTotals: { a: 5, b: 5 }, totalPool: 10 });
+    assert.equal(E.finalizeOutcome(up, at(up) - 1), null);
+    assert.deepEqual(E.finalizeOutcome(up, at(up)), { status: 'resolved', resolvedOptionId: 'a', eventAt: null });
+    const down = challenged({ votesUphold: 1, votesOverturn: 2, optionTotals: { a: 5, b: 5 }, totalPool: 10 });
+    assert.deepEqual(E.finalizeOutcome(down, at(down)), { status: 'void', resolvedOptionId: null, eventAt: null });
+    const tie = challenged({ votesUphold: 1, votesOverturn: 1 });
+    assert.equal(E.finalizeOutcome(tie, at(tie)).status, 'void');
+    const none = challenged();
+    assert.equal(E.finalizeOutcome(none, at(none)).status, 'void');
+    const zeroPool = challenged({ votesUphold: 3, votesOverturn: 0, optionTotals: { a: 0, b: 5 }, totalPool: 5 });
+    assert.equal(E.finalizeOutcome(zeroPool, at(zeroPool)).status, 'void');
+  });
+});
+
+describe('betClaim', () => {
+  const resolvedFixed = fixedMarket({ status: 'resolved', resolvedOptionId: 'a' });
+  const resolvedPool = base({ status: 'resolved', resolvedOptionId: 'a', optionTotals: { a: 100, b: 300 }, totalPool: 400 });
+  test('refuses unsettled markets', () => {
+    assert.throws(() => E.betClaim(bet(), base(), player(), NOW), /not been settled/);
+    assert.throws(() => E.betClaim(bet(), reported(), player(), NOW), /not been settled/);
+  });
+  test('void refunds the stake untaxed', () => {
+    const p = player({ penaltyUntil: NOW + DAY_MS });
+    assert.deepEqual(E.betClaim(bet(), { ...base(), status: 'void' }, p, NOW), { status: 'void', payout: 100, taxed: 0 });
+  });
+  test('loser gets nothing', () => {
+    assert.deepEqual(E.betClaim(bet({ optionId: 'b' }), resolvedFixed, player(), NOW), { status: 'lost', payout: 0, taxed: 0 });
+  });
+  test('fixed odds use the locked bet odds, with float epsilon', () => {
+    assert.deepEqual(E.betClaim(bet({ odds: 2.5 }), resolvedFixed, player(), NOW), { status: 'won', payout: 250, taxed: 0 });
+    assert.equal(E.betClaim(bet({ odds: 1.15 }), resolvedFixed, player(), NOW).payout, 115);
+    assert.equal(E.betClaim(bet({ amount: 7, odds: 1.3 }), resolvedFixed, player(), NOW).payout, 9);
+    // falls back to market odds when the bet has none
+    assert.equal(E.betClaim(bet({ odds: null }), resolvedFixed, player(), NOW).payout, 250);
+  });
+  test('pool payout is floor(amount * pool / winnerTotal)', () => {
+    assert.deepEqual(E.betClaim(bet({ amount: 100 }), resolvedPool, player(), NOW), { status: 'won', payout: 400, taxed: 0 });
+    assert.equal(E.betClaim(bet({ amount: 30 }), resolvedPool, player(), NOW).payout, 120);
+    const odd = base({ status: 'resolved', resolvedOptionId: 'a', optionTotals: { a: 3, b: 4 }, totalPool: 7 });
+    assert.equal(E.betClaim(bet({ amount: 1 }), odd, player(), NOW).payout, 2);   // floor(7/3)
+    assert.equal(E.betClaim(bet({ amount: 2 }), odd, player(), NOW).payout, 4);   // floor(14/3)
+  });
+  test('tax: only on profit, only while penalty active (strict), only when gross > amount', () => {
+    const until = NOW + 1000;
+    const taxedP = player({ penaltyUntil: until });
+    assert.deepEqual(E.betClaim(bet({ odds: 2.5 }), resolvedFixed, taxedP, NOW), { status: 'won', payout: 250 - 37, taxed: 37 }); // floor(150*.25)
+    assert.deepEqual(E.betClaim(bet({ odds: 2.5 }), resolvedFixed, taxedP, until - 1), { status: 'won', payout: 213, taxed: 37 });
+    assert.deepEqual(E.betClaim(bet({ odds: 2.5 }), resolvedFixed, taxedP, until), { status: 'won', payout: 250, taxed: 0 });
+    assert.deepEqual(E.betClaim(bet({ odds: 2.5 }), resolvedFixed, player({ penaltyUntil: null }), NOW), { status: 'won', payout: 250, taxed: 0 });
+    // no profit -> no tax
+    const evenPool = base({ status: 'resolved', resolvedOptionId: 'a', optionTotals: { a: 100 }, totalPool: 100 });
+    assert.deepEqual(E.betClaim(bet(), evenPool, taxedP, NOW), { status: 'won', payout: 100, taxed: 0 });
+    // tiny profit floors to zero tax
+    const tiny = base({ status: 'resolved', resolvedOptionId: 'a', optionTotals: { a: 100, b: 3 }, totalPool: 103 });
+    assert.deepEqual(E.betClaim(bet(), tiny, taxedP, NOW), { status: 'won', payout: 103, taxed: 0 });
+    // pool profit taxed
+    assert.deepEqual(E.betClaim(bet(), resolvedPool, taxedP, NOW), { status: 'won', payout: 400 - 75, taxed: 75 });
+    // losing and void are never taxed
+    assert.equal(E.betClaim(bet({ optionId: 'b' }), resolvedFixed, taxedP, NOW).taxed, 0);
+  });
+});
+
+describe('bondClaims', () => {
+  const fin = (over) => ({ ...reported(), status: 'resolved', ...over });
+  test('nothing before the market is final or when nobody reported', () => {
+    assert.deepEqual(E.bondClaims(reported()), { reporter: 0, challenger: 0 });
+    assert.deepEqual(E.bondClaims(challenged()), { reporter: 0, challenger: 0 });
+    assert.deepEqual(E.bondClaims({ ...base(), status: 'resolved' }), { reporter: 0, challenger: 0 });
+    assert.deepEqual(E.bondClaims({ ...base(), status: 'void' }), { reporter: 0, challenger: 0 });
+  });
+  test('unchallenged: reporter gets the bond back (also when pool-void)', () => {
+    assert.deepEqual(E.bondClaims(fin()), { reporter: 20, challenger: 0 });
+    assert.deepEqual(E.bondClaims(fin({ status: 'void' })), { reporter: 20, challenger: 0 });
+  });
+  test('challenged and upheld: reporter takes both', () => {
+    assert.deepEqual(E.bondClaims(fin({ challengedBy: 'u3', votesUphold: 2, votesOverturn: 1 })), { reporter: 40, challenger: 0 });
+  });
+  test('challenged and overturned: challenger takes both', () => {
+    assert.deepEqual(E.bondClaims(fin({ status: 'void', challengedBy: 'u3', votesUphold: 0, votesOverturn: 1 })), { reporter: 0, challenger: 40 });
+  });
+  test('tie / no votes: both refunded', () => {
+    assert.deepEqual(E.bondClaims(fin({ status: 'void', challengedBy: 'u3', votesUphold: 1, votesOverturn: 1 })), { reporter: 20, challenger: 20 });
+    assert.deepEqual(E.bondClaims(fin({ status: 'void', challengedBy: 'u3' })), { reporter: 20, challenger: 20 });
+  });
+  test('bond money is conserved', () => {
+    for (const [u, o] of [[0, 0], [1, 0], [0, 1], [3, 3], [2, 5]]) {
+      const r = E.bondClaims(fin({ status: 'void', challengedBy: 'u3', votesUphold: u, votesOverturn: o }));
+      assert.equal(r.reporter + r.challenger, 40);
     }
   });
-  test('unknown user in usersById is untaxed', () => {
-    const r = E.settleMarket(m, [b], 'a', {}, NOW, 'x');
-    assert.equal(r.betPatches.b1.taxed, 0);
-  });
-  test('no tax when payout does not exceed stake', () => {
-    const even = bet({ amount: 100, odds: 1 });
-    const r = E.settleMarket(m, [even], 'a', { u1: user({ penaltyUntil: NOW + 1000 }) }, NOW, 'x');
-    assert.deepEqual(r.betPatches.b1, { status: 'won', payout: 100, taxed: 0 });
-  });
-  test('losers are never taxed', () => {
-    const r = E.settleMarket(m, [bet({ optionId: 'b', odds: 1.5 })], 'a',
-      { u1: user({ penaltyUntil: NOW + 1000 }) }, NOW, 'x');
-    assert.deepEqual(r.betPatches.b1, { status: 'lost', payout: 0, taxed: 0 });
-  });
-  test('pool payouts are taxed on profit too', () => {
-    const pm = poolMarket();
-    const bets = [
-      bet({ id: 'p1', uid: 'u1', optionId: 'a', amount: 100 }),
-      bet({ id: 'p2', uid: 'u2', optionId: 'b', amount: 300 }),
-    ];
-    const r = E.settleMarket(pm, bets, 'a', { u1: user({ penaltyUntil: NOW + 1 }) }, NOW, 'x');
-    // payout 400, profit 300, tax 75
-    assert.deepEqual(r.betPatches.p1, { status: 'won', payout: 325, taxed: 75 });
-  });
 });
 
-describe('settleMarket (pool)', () => {
-  test('pro-rata split with flooring', () => {
-    const pm = poolMarket();
-    const bets = [
-      bet({ id: 'p1', uid: 'u1', optionId: 'a', amount: 10 }),
-      bet({ id: 'p2', uid: 'u2', optionId: 'a', amount: 20 }),
-      bet({ id: 'p3', uid: 'u3', optionId: 'b', amount: 5 }),
-    ];
-    const r = E.settleMarket(pm, bets, 'a', {}, NOW, 'x');
-    // pool 35, winners 30: 10*35/30 = 11.66 -> 11, 20*35/30 = 23.33 -> 23
-    assert.deepEqual(r.betPatches.p1, { status: 'won', payout: 11, taxed: 0 });
-    assert.deepEqual(r.betPatches.p2, { status: 'won', payout: 23, taxed: 0 });
-    assert.deepEqual(r.betPatches.p3, { status: 'lost', payout: 0, taxed: 0 });
-    assert.deepEqual(r.userDeltas, { u1: { balance: 11, totalWon: 11 }, u2: { balance: 23, totalWon: 23 } });
-    assert.equal(r.marketPatch.status, 'resolved');
+describe('bankruptcy', () => {
+  test('netWorth and isBroke', () => {
+    assert.equal(E.netWorth(player({ balance: 40, openStake: 60 })), 100);
+    assert.equal(E.isBroke(player({ balance: 0, openStake: 0 })), true);
+    assert.equal(E.isBroke(player({ balance: 0.5, openStake: 0 })), true);
+    assert.equal(E.isBroke(player({ balance: 1, openStake: 0 })), false);
+    assert.equal(E.isBroke(player({ balance: 0, openStake: 5 })), false);
   });
-  test('void when nobody bet on the winner', () => {
-    const pm = poolMarket();
-    const bets = [
-      bet({ id: 'p1', uid: 'u1', optionId: 'b', amount: 10 }),
-      bet({ id: 'p2', uid: 'u2', optionId: 'b', amount: 20 }),
-    ];
-    const r = E.settleMarket(pm, bets, 'a', {}, NOW, 'x', NOW - 1);
-    assert.deepEqual(r.marketPatch, { status: 'void', resolvedOptionId: null, resolvedAt: NOW, resolvedBy: 'x' });
-    assert.deepEqual(r.betPatches.p1, { status: 'void', payout: 10, taxed: 0 });
-    assert.deepEqual(r.betPatches.p2, { status: 'void', payout: 20, taxed: 0 });
-    assert.equal(r.userDeltas.u1.balance, 10);
-    assert.equal(r.userDeltas.u2.balance, 20);
-    assert.ok(!r.userDeltas.u1.totalWon);
+  test('canClaimRestart: next UTC midnight after brokeSince', () => {
+    const since = Date.UTC(2026, 5, 15, 23, 59, 59);
+    const midnight = Date.UTC(2026, 5, 16);
+    const p = player({ balance: 0, brokeSince: since });
+    assert.equal(E.canClaimRestart(p, midnight - 1), false);
+    assert.equal(E.canClaimRestart(p, midnight), true);
+    assert.equal(E.canClaimRestart(player({ balance: 0, brokeSince: Date.UTC(2026, 5, 15, 0, 0, 0) }), midnight - 1), false);
+    assert.equal(E.restartAvailableAt(p), midnight);
+    assert.equal(E.restartAvailableAt(player()), null);
+    assert.equal(E.canClaimRestart(player({ balance: 0, brokeSince: null }), NOW), false);
+    assert.equal(E.canClaimRestart(player({ balance: 50, brokeSince: since }), midnight), false);
+    assert.equal(E.canClaimRestart(player({ balance: 0, openStake: 3, brokeSince: since }), midnight), false);
   });
-  test('void with no bets at all', () => {
-    const r = E.settleMarket(poolMarket(), [], 'a', {}, NOW, 'x');
-    assert.equal(r.marketPatch.status, 'void');
-    assert.deepEqual(r.betPatches, {});
-    assert.deepEqual(r.userDeltas, {});
-  });
-});
-
-describe('voidMarket', () => {
-  test('refunds everyone, only open bets of this market', () => {
-    const m = fixedMarket();
-    const bets = [
-      bet({ id: 'a1', uid: 'u1', amount: 10 }),
-      bet({ id: 'a2', uid: 'u1', amount: 15, optionId: 'b' }),
-      bet({ id: 'a3', uid: 'u2', amount: 7 }),
-      bet({ id: 'done', uid: 'u3', amount: 99, status: 'won', payout: 200 }),
-      bet({ id: 'other', marketId: 'zzz', uid: 'u4', amount: 5 }),
-    ];
-    const r = E.voidMarket(m, bets, NOW, 'alice');
-    assert.deepEqual(r.marketPatch, { status: 'void', resolvedOptionId: null, resolvedAt: NOW, resolvedBy: 'alice' });
-    assert.deepEqual(Object.keys(r.betPatches).sort(), ['a1', 'a2', 'a3']);
-    assert.deepEqual(r.betPatches.a2, { status: 'void', payout: 15, taxed: 0 });
-    assert.equal(r.userDeltas.u1.balance, 25);
-    assert.equal(r.userDeltas.u2.balance, 7);
-    assert.ok(!r.userDeltas.u1.totalWon, 'refunds do not count as winnings');
-    assert.ok(!('u3' in r.userDeltas) && !('u4' in r.userDeltas));
-  });
-});
-
-describe('netWorth / bankruptcy', () => {
-  test('netWorth counts only own open bets', () => {
-    const bets = [
-      bet({ id: '1', amount: 50 }),
-      bet({ id: '2', amount: 25, status: 'won', payout: 60 }),
-      bet({ id: '3', amount: 10, uid: 'u2' }),
-      bet({ id: '4', amount: 5, status: 'lost' }),
-    ];
-    assert.equal(E.netWorth(user({ balance: 100 }), bets), 150);
-    assert.equal(E.netWorth(user({ balance: 100 }), []), 100);
-  });
-
-  test('isBroke', () => {
-    assert.equal(E.isBroke(user({ balance: 0 }), []), true);
-    assert.equal(E.isBroke(user({ balance: 1 }), []), false);
-    assert.equal(E.isBroke(user({ balance: 0 }), [bet({ amount: 5 })]), false, 'open bet keeps you alive');
-    assert.equal(E.isBroke(user({ balance: 0 }), [bet({ status: 'lost' }), bet({ uid: 'u2' })]), true);
-  });
-
-  test('canClaimRestart across a day boundary', () => {
-    const today = E.dayKey(NOW);
-    const yesterday = E.dayKey(NOW - DAY_MS);
-    const tomorrowMs = NOW + DAY_MS;
-    const u = user({ balance: 0, brokeSince: today });
-    assert.equal(E.canClaimRestart(u, [], NOW), false, 'same day');
-    assert.equal(E.canClaimRestart(u, [], tomorrowMs), true, 'next day');
-    assert.equal(E.canClaimRestart(user({ balance: 0, brokeSince: yesterday }), [], NOW), true);
-    assert.equal(E.canClaimRestart(user({ balance: 0, brokeSince: null }), [], tomorrowMs), false);
-    assert.equal(E.canClaimRestart(user({ balance: 5, brokeSince: yesterday }), [], NOW), false, 'not broke');
-    assert.equal(E.canClaimRestart(user({ balance: 0, brokeSince: yesterday }), [bet({ amount: 1 })], NOW), false);
-  });
-
   test('restartPatch and penaltyActive', () => {
-    const u = user({ balance: 0, bankruptcies: 2, brokeSince: '2026-06-14' });
-    const before = JSON.stringify(u);
-    const p = E.restartPatch(u, NOW);
-    assert.deepEqual(p, { balance: 100, bankruptcies: 3, brokeSince: null, penaltyUntil: NOW + 3 * DAY_MS });
-    assert.equal(JSON.stringify(u), before);
-    assert.equal(E.penaltyActive({ ...u, penaltyUntil: NOW + 1 }, NOW), true);
-    assert.equal(E.penaltyActive({ ...u, penaltyUntil: NOW }, NOW), false);
-    assert.equal(E.penaltyActive({ ...u, penaltyUntil: null }, NOW), false);
-    assert.equal(E.penaltyActive({ ...u, ...p }, NOW + 3 * DAY_MS - 1), true);
-    assert.equal(E.penaltyActive({ ...u, ...p }, NOW + 3 * DAY_MS), false);
+    const p = player({ balance: 0, bankruptcies: 2 });
+    assert.deepEqual(E.restartPatch(p, NOW), { balance: 100, bankruptcies: 3, brokeSince: null, penaltyUntil: NOW + 3 * DAY_MS });
+    assert.equal(E.penaltyActive(player({ penaltyUntil: NOW + 1 }), NOW), true);
+    assert.equal(E.penaltyActive(player({ penaltyUntil: NOW }), NOW), false);
+    assert.equal(E.penaltyActive(player(), NOW), false);
   });
 });
 
 describe('buildCustomMarket', () => {
-  const base = { id: 'c1', user: user(), now: NOW, title: 'Who wins?', description: ' desc ', kind: 'choice',
-    optionLabels: ['Red', ' Blue '], closesAt: NOW + DAY_MS };
-
-  test('choice market is pool with o1.. ids', () => {
-    const m = E.buildCustomMarket(base);
+  const args = (over = {}) => ({
+    id: 'm9', player: player(), now: NOW, title: '  Will it snow?  ', description: ' d ', kind: 'choice',
+    optionLabels: ['Yes', ' No ', ''], closesAt: NOW + DAY_MS, ...over,
+  });
+  test('choice => pool, fully normalised', () => {
+    const m = E.buildCustomMarket(args());
+    assert.equal(m.title, 'Will it snow?');
     assert.equal(m.mode, 'pool');
-    assert.equal(m.kind, 'choice');
-    assert.equal(m.type, 'custom');
-    assert.equal(m.templateId, null);
-    assert.deepEqual(m.options, [{ id: 'o1', label: 'Red', odds: null }, { id: 'o2', label: 'Blue', odds: null }]);
-    assert.deepEqual(m.optionTotals, { o1: 0, o2: 0 });
-    assert.equal(m.totalPool, 0);
-    assert.equal(m.betCount, 0);
-    assert.equal(m.status, 'open');
+    assert.deepEqual(m.options, [{ id: 'o1', label: 'Yes', odds: null }, { id: 'o2', label: 'No', odds: null }]);
+    assert.deepEqual(m.optionIds, ['o1', 'o2']);
+    assert.equal(m.oddsById, null);
     assert.equal(m.createdBy, 'u1');
-    assert.equal(m.createdByName, 'alice');
-    assert.equal(m.openedAt, NOW);
-    assert.equal(m.closesAt, NOW + DAY_MS);
-    assert.equal(m.description, 'desc');
-    assert.equal(m.resolvedOptionId, null);
-    assert.equal(m.eventAt, null);
+    assert.equal(m.type, 'custom');
+    assert.equal(m.status, 'open');
+    assert.equal(m.reportableAt, NOW + DAY_MS);
+    assert.equal(E.validateCreateMarket(player(), m, NOW), null);
   });
-
-  test('timer market uses default buckets and 12h close', () => {
-    const m = E.buildCustomMarket({ id: 't1', user: user(), now: NOW, title: 'How long till lunch?', kind: 'timer' });
+  test('accepts legacy `user` arg', () => {
+    assert.equal(E.buildCustomMarket(args({ player: undefined, user: player({ uid: 'z' }) })).createdBy, 'z');
+  });
+  test('timer => fixed, default buckets, default close 12h', () => {
+    const m = E.buildCustomMarket(args({ kind: 'timer', closesAt: undefined, optionLabels: undefined }));
     assert.equal(m.mode, 'fixed');
-    assert.deepEqual(m.options, E.DEFAULT_TIMER_BUCKETS);
     assert.equal(m.closesAt, NOW + 12 * HOUR_MS);
-    assert.deepEqual(Object.keys(m.optionTotals), ['d1', 'd4', 'd8', 'never']);
-    assert.equal(m.description, '');
-    const m2 = E.buildCustomMarket({ id: 't2', user: user(), now: NOW, title: 'abc', kind: 'timer', closesAt: NOW + 5 });
-    assert.equal(m2.closesAt, NOW + 5);
+    assert.equal(m.expiresAt, NOW + 8 * DAY_MS);
+    assert.equal(m.expiryOptionId, 'never');
+    assert.equal(m.reportableAt, NOW);
+    assert.equal(E.validateCreateMarket(player(), m, NOW), null);
   });
-
-  test('timer options are copies, not the shared defaults', () => {
-    const m = E.buildCustomMarket({ id: 't1', user: user(), now: NOW, title: 'abc', kind: 'timer' });
-    m.options[0].odds = 99;
-    assert.equal(E.DEFAULT_TIMER_BUCKETS[0].odds, 6);
-  });
-
   test('validation errors', () => {
-    const bad = (over, re) => assert.throws(() => E.buildCustomMarket({ ...base, ...over }), re);
-    bad({ title: 'ab' }, /title/i);
-    bad({ title: '   ' }, /title/i);
-    bad({ title: undefined }, /title/i);
-    bad({ title: 'x'.repeat(141) }, /title/i);
-    bad({ optionLabels: ['Only'] }, /option/i);
-    bad({ optionLabels: ['A', ' '] }, /option/i);
-    bad({ optionLabels: ['A', 'a'] }, /unique/i);
-    bad({ optionLabels: ['1', '2', '3', '4', '5', '6', '7'] }, /option/i);
-    bad({ optionLabels: undefined }, /option/i);
-    bad({ closesAt: NOW }, /future/i);
-    bad({ closesAt: NOW - 1 }, /future/i);
-    bad({ closesAt: undefined }, /clos/i);
-    bad({ kind: 'weird' }, /kind/i);
-    assert.throws(() => E.buildCustomMarket({ ...base, kind: 'timer', closesAt: NOW - 5 }), /future/i);
-  });
-
-  test('boundaries accepted', () => {
-    assert.doesNotThrow(() => E.buildCustomMarket({ ...base, title: 'abc' }));
-    assert.doesNotThrow(() => E.buildCustomMarket({ ...base, title: 'x'.repeat(140) }));
-    assert.doesNotThrow(() => E.buildCustomMarket({ ...base, optionLabels: ['1', '2', '3', '4', '5', '6'] }));
+    assert.throws(() => E.buildCustomMarket(args({ title: 'ab' })), /at least 3/);
+    assert.throws(() => E.buildCustomMarket(args({ title: 'x'.repeat(141) })), /at most 140/);
+    assert.throws(() => E.buildCustomMarket(args({ kind: 'nope' })), /kind/);
+    assert.throws(() => E.buildCustomMarket(args({ optionLabels: ['only'] })), /at least 2/);
+    assert.throws(() => E.buildCustomMarket(args({ optionLabels: ['1', '2', '3', '4', '5', '6', '7'] })), /At most 6/);
+    assert.throws(() => E.buildCustomMarket(args({ optionLabels: ['a', 'A'] })), /unique/);
+    assert.throws(() => E.buildCustomMarket(args({ closesAt: NOW })), /future/);
+    assert.throws(() => E.buildCustomMarket(args({ closesAt: undefined })), /closing time/i);
   });
 });
 
-describe('prng', () => {
-  test('mulberry32 deterministic in [0,1)', () => {
-    const a = E.mulberry32(42);
-    const b = E.mulberry32(42);
-    const seqA = Array.from({ length: 50 }, a);
-    const seqB = Array.from({ length: 50 }, b);
-    assert.deepEqual(seqA, seqB);
-    assert.ok(seqA.every((x) => x >= 0 && x < 1));
-    assert.notDeepEqual(seqA, Array.from({ length: 50 }, E.mulberry32(43)));
+describe('houseMarketMismatch', () => {
+  const tpl = () => ({
+    ...fixedMarket({ kind: 'choice', createdBy: 'house', type: 'auto', id: 'auto-2026-06-15-x', title: 'Coin flip' }),
   });
-  test('hashString stable 32-bit unsigned', () => {
-    assert.equal(E.hashString('2026-06-15'), E.hashString('2026-06-15'));
-    assert.notEqual(E.hashString('2026-06-15'), E.hashString('2026-06-16'));
-    const h = E.hashString('anything');
-    assert.ok(Number.isInteger(h) && h >= 0 && h <= 0xffffffff);
+  test('identical markets (even built at different times) match', () => {
+    const a = tpl();
+    const later = E.normalizeMarket({ ...tpl(), openedAt: NOW + 5000, closesAt: NOW + 5000 + HOUR_MS, reportableAt: undefined });
+    assert.equal(E.houseMarketMismatch(later, a), null);
+  });
+  test('detects tampering', () => {
+    const a = tpl();
+    assert.match(E.houseMarketMismatch({ ...a, title: 'Free money' }, a), /Title/);
+    assert.match(E.houseMarketMismatch({ ...a, oddsById: { a: 20, b: 1.5 } }, a), /Odds/);
+    assert.match(E.houseMarketMismatch({ ...a, options: [a.options[0]] }, a), /Options/);
+    assert.match(E.houseMarketMismatch({ ...a, options: [{ ...a.options[0], label: 'X' }, a.options[1]] }, a), /labels/);
+    assert.match(E.houseMarketMismatch({ ...a, closesAt: a.closesAt + 1 }, a), /window/);
+    assert.match(E.houseMarketMismatch({ ...a, mode: 'pool' }, a), /Mode/);
+    assert.match(E.houseMarketMismatch({ ...a, createdBy: 'u1' }, a), /house/);
+    assert.match(E.houseMarketMismatch({ ...a, kind: 'timer' }, a), /Kind/);
+    assert.ok(E.houseMarketMismatch(null, a));
+  });
+  test('timer buckets are compared', () => {
+    const a = timerMarket({ createdBy: 'house', type: 'auto' });
+    const b = timerMarket({ createdBy: 'house', type: 'auto' });
+    assert.equal(E.houseMarketMismatch(b, a), null);
+    b.bucketsById = { ...b.bucketsById, d1: { fromMs: 0, toMs: 5 } };
+    assert.match(E.houseMarketMismatch(b, a), /buckets/);
+  });
+  test('oracle markets ignore baseline-dependent title/labels/params', () => {
+    const o = (title, thr) => ({ ...tpl(), title, oracle: { type: 'price_above', params: { threshold: thr }, source: 's', label: 'l' } });
+    assert.equal(E.houseMarketMismatch(o('BTC above 65k?', 65000), o('BTC above 66k?', 66000)), null);
+    assert.match(E.houseMarketMismatch({ ...o('a', 1), oracle: null }, o('a', 1)), /Oracle/);
   });
 });
