@@ -238,7 +238,7 @@ describe('buildAutoMarket (plain templates): v2 fields', () => {
     assert.deepEqual(Object.keys(m.oddsById), m.optionIds);
     assert.deepEqual(m.bucketsById.h3, { fromMs: 0, toMs: 3 * HOUR_MS });
     assert.deepEqual(m.bucketsById.never, { fromMs: DAY_MS, toMs: null });
-    assert.equal(m.expiresAt, NOW + DAY_MS);
+    assert.equal(m.expiresAt, m.closesAt + DAY_MS); // per-bet windows: last bet's window must elapse
     assert.equal(m.expiryOptionId, 'never');
     assert.equal(m.reportableAt, NOW);
     assert.deepEqual(m.optionTotals, { h3: 0, h12: 0, h24: 0, never: 0 });
@@ -378,7 +378,7 @@ describe('every oracle template with a working baseline', () => {
     const data = { series: [{ granularity: 300, candles: fx('coinbase-candles-btc-5m.json') }, { granularity: 3600, candles: fx('coinbase-candles-btc-1h.json') }] };
     const r = evaluate(m.oracle, data, m);
     assert.deepEqual(r, { status: 'final', optionId: 'h24', eventAt: Date.UTC(2026, 8, 30, 19, 35) });
-    assert.equal(m.expiresAt - NOW, 7 * DAY_MS);
+    assert.equal(m.expiresAt - m.closesAt, 7 * DAY_MS);
     assert.equal(findTemplate('oracle-btc-move-10').buckets.at(-1).fromDays, 14);
   });
 

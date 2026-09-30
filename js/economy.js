@@ -131,7 +131,8 @@ export function normalizeMarket(m) {
     if (!has(m, 'expiresAt')) {
       const finite = Object.values(buckets).map((b) => b.toMs).filter((t) => t != null);
       const hasOpenEnded = Object.values(buckets).some((b) => b.toMs == null);
-      out.expiresAt = hasOpenEnded && finite.length && isNum(out.openedAt) ? out.openedAt + Math.max(...finite) : null;
+      // the last possible bet (placed just before closesAt) must see its whole longest window elapse
+      out.expiresAt = hasOpenEnded && finite.length && isNum(out.closesAt) ? out.closesAt + Math.max(...finite) : null;
     }
     if (!has(m, 'expiryOptionId')) {
       const open = Object.entries(buckets).find(([, b]) => b.toMs == null);
@@ -331,7 +332,7 @@ export function timerBucketFor(market, eventAt) {
   return (hit || options[options.length - 1]).id;
 }
 
-/** Open-ended bucket id when an open timer market has outlasted its longest finite bucket, else null. */
+/** Open-ended bucket id when an open timer market has outlasted closesAt + its longest finite bucket, else null. */
 export function timerAutoResolution(market, now) {
   if (!market || market.kind !== 'timer' || market.status !== 'open') return null;
   if (isNum(market.expiresAt) && market.expiryOptionId) return now >= market.expiresAt ? market.expiryOptionId : null;
@@ -340,7 +341,7 @@ export function timerAutoResolution(market, now) {
   if (!openEnded) return null;
   const finite = options.filter((o) => o.toDays != null).map((o) => o.toDays);
   const maxFinite = finite.length ? Math.max(...finite) : 0;
-  return now >= market.openedAt + maxFinite * DAY_MS ? openEnded.id : null;
+  return now >= (isNum(market.closesAt) ? market.closesAt : market.openedAt) + maxFinite * DAY_MS ? openEnded.id : null;
 }
 
 // ---------------------------------------------------------------- report / challenge / vote
@@ -354,14 +355,13 @@ export function validateReport(player, market, optionId, eventAt, now) {
   if (market.status !== 'open') return 'This market is not open';
   if (market.type === 'custom' && market.createdBy !== player.uid) return 'Only the creator can report this market';
   if (!isNum(market.reportableAt) || now < market.reportableAt) return "It's too early to report a result for this market";
-  if (!optionIdsOf(market).includes(optionId)) return 'Unknown option';
   if (market.kind === 'timer') {
+    // timer reports carry only the event time; each bet is judged against its own placedAt
     if (!isNum(eventAt)) return 'Say when it happened';
     if (eventAt < market.openedAt) return "The event can't be before the market opened";
     if (eventAt > now) return "The event can't be in the future";
-    const b = market.bucketsById && market.bucketsById[optionId];
-    const off = eventAt - market.openedAt;
-    if (!b || off < b.fromMs || (b.toMs != null && off >= b.toMs)) return "That time doesn't fit the chosen option";
+  } else if (!optionIdsOf(market).includes(optionId)) {
+    return 'Unknown option';
   }
   if (player.balance < BOND) return `Not enough sonnetous for the ${formatSonnetous(BOND)} bond`;
   return null;
@@ -401,6 +401,10 @@ export function finalizeOutcome(market, now) {
   if (!market) return null;
   const VOID = { status: 'void', resolvedOptionId: null, eventAt: null };
   const reportedResult = () => {
+    if (market.kind === 'timer') {
+      // per-bet windows: no winning option, betClaim judges every bet against eventAt
+      return { status: 'resolved', resolvedOptionId: null, eventAt: isNum(market.reportedEventAt) ? market.reportedEventAt : null };
+    }
     if (market.mode === 'pool' && !((market.optionTotals || {})[market.reportedOptionId] > 0)) return VOID;
     return {
       status: 'resolved',
@@ -436,7 +440,17 @@ export function penaltyActive(player, now) {
 export function betClaim(bet, market, player, now) {
   if (!market || !isFinal(market)) throw new Error('This market has not been settled yet');
   if (market.status === 'void') return { status: 'void', payout: bet.amount, taxed: 0 };
-  if (bet.optionId !== market.resolvedOptionId) return { status: 'lost', payout: 0, taxed: 0 };
+  const timerEvent = market.kind === 'timer' && isNum(market.eventAt);
+  if (timerEvent) {
+    // event reported: judged per bet. Event before the bet => refund; else the bet's window must contain it.
+    if (market.eventAt < bet.placedAt) return { status: 'void', payout: bet.amount, taxed: 0 };
+    const off = market.eventAt - bet.placedAt;
+    const b = market.bucketsById && market.bucketsById[bet.optionId];
+    if (!b || off < b.fromMs || (b.toMs != null && off >= b.toMs)) return { status: 'lost', payout: 0, taxed: 0 };
+  } else if (bet.optionId !== market.resolvedOptionId) {
+    // pool/choice result, or timer expiry with no event (only the open-ended bucket wins)
+    return { status: 'lost', payout: 0, taxed: 0 };
+  }
   let gross;
   if (market.mode === 'pool') {
     const winTotal = (market.optionTotals || {})[market.resolvedOptionId] || 0;

@@ -614,42 +614,85 @@ test('voidMarket: creator only, only while nobody has bet', async () => {
 
 // ---------------------------------------------------------------- timers
 
-test('timer market: reporting an event picks the bucket, expiry resolves to the open-ended bucket', async () => {
+test('timer market: bets are judged from their own placedAt; expiry resolves the open-ended bucket', async () => {
   const w = await openWorld();
   const c = await user(w, 'creator');
   const a = await user(w, 'alice');
   const b = await user(w, 'bob');
+  const late = await user(w, 'latecomer');
   const tm = economy.buildCustomMarket({ id: 't1', player: me(c), now: w.clock.t, title: 'How long till lunch?', kind: 'timer' });
   await c.createMarket(tm);
-  const bet1 = await a.placeBet('t1', 'd4', 100); // 3x
-  const bet2 = await b.placeBet('t1', 'never', 100); // 1.3x
+  assert.equal(market(c, 't1').expiresAt, tm.closesAt + 8 * DAY_MS);
+  const bet1 = await a.placeBet('t1', 'd4', 100); // 3x, window [1d, 4d) after this bet
+  const bet2 = await b.placeBet('t1', 'never', 100);
   assert.equal(bet1.odds, 3);
-  // creator reports it happened 2 days in -> bucket d4
+  // 2 days later the creator reports it happened (bets are still open until 12h, so this bet is closed by then)
   advance(w, 2 * DAY_MS);
-  await rejects(c.reportResult('t1', 'd1', w.clock.t, null), /doesn't fit/);
-  await rejects(c.reportResult('t1', 'd4', w.clock.t + 1, null), /future/);
-  await rejects(c.reportResult('t1', 'd4', T0 - 1, null), /before the market opened/);
-  await rejects(c.reportResult('t1', 'd4', null, null), /when it happened/);
-  await c.reportResult('t1', 'd4', w.clock.t, null);
-  assert.equal(market(c, 't1').reportedEventAt, w.clock.t);
-  const eventAt = w.clock.t;
+  const eventAt = w.clock.t - 3 * HOUR_MS;
+  await rejects(c.reportResult('t1', null, w.clock.t + 1, null), /future/);
+  await rejects(c.reportResult('t1', null, T0 - 1, null), /before the market opened/);
+  await rejects(c.reportResult('t1', null, null, null), /when it happened/);
+  await c.reportResult('t1', 'd4', eventAt, null); // option id is ignored for timers
+  const rep = market(c, 't1');
+  assert.equal(rep.reportedEventAt, eventAt);
+  assert.equal(rep.reportedOptionId, null);
   advance(w, 12 * HOUR_MS);
   const fin = await b.finalizeMarket('t1');
-  assert.deepEqual([fin.status, fin.resolvedOptionId, fin.eventAt], ['resolved', 'd4', eventAt]);
-  assert.equal((await a.claimBet(bet1.id)).payout, 300);
+  assert.deepEqual([fin.status, fin.resolvedOptionId, fin.eventAt], ['resolved', null, eventAt]);
+  // event happened (2d - 3h) after both bets => d4 wins, 'never' loses
+  const won = await a.claimBet(bet1.id);
+  assert.deepEqual([won.status, won.payout], ['won', 300]);
   assert.equal((await b.claimBet(bet2.id)).status, 'lost');
+  assert.equal(await c.claimBond('t1'), BOND);
+  assert.equal(late && me(late).balance, 500);
+});
 
-  // second timer nobody reports: expires at openedAt + 8 days
+test('timer market: a bet placed after the event happened is refunded', async () => {
+  const w = await openWorld();
+  const c = await user(w, 'creator');
+  const early = await user(w, 'early');
+  const sniper = await user(w, 'sniper');
+  await c.createMarket(economy.buildCustomMarket({ id: 't1', player: me(c), now: w.clock.t, title: 'How long till lunch?', kind: 'timer' }));
+  const eBet = await early.placeBet('t1', 'd1', 100);
+  advance(w, HOUR_MS);
+  const eventAt = w.clock.t; // the event happens now...
+  advance(w, 10 * 60 * 1000);
+  const sBet = await sniper.placeBet('t1', 'd1', 100); // ...and the sniper bets "within 1 day" afterwards
+  advance(w, 2 * HOUR_MS);
+  await c.reportResult('t1', null, eventAt, null);
+  advance(w, 12 * HOUR_MS);
+  await early.finalizeMarket('t1');
+  assert.deepEqual((({ status, payout }) => ({ status, payout }))(await early.claimBet(eBet.id)), { status: 'won', payout: 600 });
+  assert.deepEqual((({ status, payout }) => ({ status, payout }))(await sniper.claimBet(sBet.id)), { status: 'void', payout: 100 });
+  assert.equal(me(sniper).balance, 500);
+});
+
+test('timer market: eventAt == placedAt still counts for the bet; unreported timer expires to the open-ended bucket', async () => {
+  const w = await openWorld();
+  const c = await user(w, 'creator');
+  const a = await user(w, 'alice');
+  const b = await user(w, 'bob');
+  await c.createMarket(economy.buildCustomMarket({ id: 't1', player: me(c), now: w.clock.t, title: 'How long till lunch?', kind: 'timer' }));
+  const eqBet = await a.placeBet('t1', 'd1', 100);
+  await c.reportResult('t1', null, w.clock.t, null); // eventAt == placedAt
+  advance(w, 12 * HOUR_MS);
+  await a.finalizeMarket('t1');
+  assert.equal((await a.claimBet(eqBet.id)).status, 'won');
+
   const t2 = economy.buildCustomMarket({ id: 't2', player: me(c), now: w.clock.t, title: 'How long till dinner?', kind: 'timer' });
   await c.createMarket(t2);
-  const late = await b.placeBet('t2', 'never', 100);
-  advance(w, 8 * DAY_MS - 1);
+  const noEvent = await b.placeBet('t2', 'never', 100);
+  const lose = await a.placeBet('t2', 'd8', 50);
+  advance(w, 12 * HOUR_MS + 8 * DAY_MS - 1);
   await rejects(b.finalizeMarket('t2'), /can't be finalized yet/);
   advance(w, 1);
   const exp = await a.finalizeMarket('t2');
   assert.deepEqual([exp.status, exp.resolvedOptionId, exp.eventAt], ['resolved', 'never', null]);
-  const claimed = await b.claimBet(late.id);
+  const claimed = await b.claimBet(noEvent.id);
   assert.deepEqual([claimed.status, claimed.payout], ['won', 130]);
+  assert.equal((await a.claimBet(lose.id)).status, 'lost');
+  // an expired, unreported timer has no bond to pay
+  await rejects(c.claimBond('t2'), /bond/i);
 });
 
 // ---------------------------------------------------------------- bankruptcy

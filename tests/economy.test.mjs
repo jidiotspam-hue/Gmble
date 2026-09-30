@@ -133,7 +133,7 @@ describe('normalizeMarket', () => {
       d8: { fromMs: 4 * DAY_MS, toMs: 8 * DAY_MS },
       never: { fromMs: 8 * DAY_MS, toMs: null },
     });
-    assert.equal(m.expiresAt, NOW + 8 * DAY_MS);
+    assert.equal(m.expiresAt, m.closesAt + 8 * DAY_MS); // the last bet's longest window must elapse
     assert.equal(m.expiryOptionId, 'never');
     assert.equal(m.reportableAt, NOW);
     assert.deepEqual(m.oddsById, { d1: 6, d4: 3, d8: 1.8, never: 1.3 });
@@ -309,8 +309,9 @@ describe('timer helpers', () => {
     assert.equal(E.timerBucketFor(m, NOW + 100 * DAY_MS), 'never');
   });
   test('timerAutoResolution boundary', () => {
-    assert.equal(E.timerAutoResolution(m, NOW + 8 * DAY_MS - 1), null);
-    assert.equal(E.timerAutoResolution(m, NOW + 8 * DAY_MS), 'never');
+    const exp = m.closesAt + 8 * DAY_MS;
+    assert.equal(E.timerAutoResolution(m, exp - 1), null);
+    assert.equal(E.timerAutoResolution(m, exp), 'never');
     assert.equal(E.timerAutoResolution({ ...m, status: 'reported' }, NOW + 9 * DAY_MS), null);
     assert.equal(E.timerAutoResolution(base(), NOW + 99 * DAY_MS), null);
   });
@@ -345,24 +346,20 @@ describe('validateReport', () => {
     assert.match(E.validateReport(player({ balance: 19 }), closedChoice, 'a', null, at), /Not enough sonnetous/);
     assert.equal(E.validateReport(player({ balance: 20 }), closedChoice, 'a', null, at), null);
   });
-  test('timer: eventAt window and bucket', () => {
+  test('timer: only eventAt matters (openedAt <= eventAt <= now), no option/bucket check', () => {
     const t = timerMarket({ createdBy: 'u1' });
     const now = NOW + 3 * DAY_MS;
     const p = player();
-    assert.equal(E.validateReport(p, t, 'd4', NOW + 2 * DAY_MS, now), null);
-    assert.equal(E.validateReport(p, t, 'd4', NOW + DAY_MS, now), null);           // lower edge inclusive
-    assert.match(E.validateReport(p, t, 'd1', NOW + DAY_MS, now), /doesn't fit/);  // upper edge exclusive
-    assert.equal(E.validateReport(p, t, 'd1', NOW + DAY_MS - 1, now), null);
-    assert.match(E.validateReport(p, t, 'd4', NOW - 1, now), /before the market opened/);
-    assert.equal(E.validateReport(p, t, 'd1', NOW, now), null);                    // eventAt == openedAt
-    assert.match(E.validateReport(p, t, 'd4', now + 1, now), /future/);
-    assert.equal(E.validateReport(p, t, 'd4', now, now), null);                    // eventAt == now
-    assert.match(E.validateReport(p, t, 'd4', null, now), /when it happened/);
-    assert.match(E.validateReport(p, t, 'd4', NaN, now), /when it happened/);
-    // reportable immediately after opening (before betting closes)
-    assert.equal(E.validateReport(p, t, 'd1', NOW, NOW), null);
-    // open-ended bucket
-    assert.equal(E.validateReport(p, t, 'never', NOW + 9 * DAY_MS, NOW + 10 * DAY_MS), null);
+    assert.equal(E.validateReport(p, t, null, NOW + 2 * DAY_MS, now), null);
+    assert.equal(E.validateReport(p, t, 'd1', NOW + 2 * DAY_MS, now), null);        // optionId ignored
+    assert.equal(E.validateReport(p, t, null, NOW, now), null);                      // eventAt == openedAt
+    assert.match(E.validateReport(p, t, null, NOW - 1, now), /before the market opened/);
+    assert.equal(E.validateReport(p, t, null, now, now), null);                      // eventAt == now
+    assert.match(E.validateReport(p, t, null, now + 1, now), /future/);
+    assert.match(E.validateReport(p, t, null, null, now), /when it happened/);
+    assert.match(E.validateReport(p, t, null, NaN, now), /when it happened/);
+    assert.match(E.validateReport(player({ balance: 19 }), t, null, NOW, now), /Not enough sonnetous/);
+    assert.equal(E.validateReport(p, t, null, NOW, NOW), null);                      // reportable right after opening
   });
 });
 
@@ -414,6 +411,7 @@ describe('finalizeOutcome', () => {
   });
   test('timer expiry at exactly expiresAt', () => {
     const t = timerMarket();
+    assert.equal(t.expiresAt, t.closesAt + 8 * DAY_MS);
     assert.equal(E.finalizeOutcome(t, t.expiresAt - 1), null);
     assert.deepEqual(E.finalizeOutcome(t, t.expiresAt), { status: 'resolved', resolvedOptionId: 'never', eventAt: null });
   });
@@ -423,10 +421,19 @@ describe('finalizeOutcome', () => {
     assert.deepEqual(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS),
       { status: 'resolved', resolvedOptionId: 'a', eventAt: null });
   });
-  test('reported timer keeps the reported eventAt', () => {
-    const m = { ...timerMarket(), status: 'reported', reportedOptionId: 'd4', reportedEventAt: NOW + 2 * DAY_MS, reportedAt: NOW + 3 * DAY_MS };
+  test('reported timer resolves with no winning option, only the eventAt', () => {
+    const m = { ...timerMarket(), status: 'reported', reportedOptionId: null, reportedEventAt: NOW + 2 * DAY_MS, reportedAt: NOW + 3 * DAY_MS, reportedBy: 'u2' };
+    assert.equal(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS - 1), null);
     assert.deepEqual(E.finalizeOutcome(m, m.reportedAt + E.CHALLENGE_WINDOW_MS),
-      { status: 'resolved', resolvedOptionId: 'd4', eventAt: NOW + 2 * DAY_MS });
+      { status: 'resolved', resolvedOptionId: null, eventAt: NOW + 2 * DAY_MS });
+    const up = { ...m, status: 'challenged', challengedBy: 'u3', challengedAt: m.reportedAt + HOUR_MS, votesUphold: 1, votesOverturn: 0 };
+    assert.deepEqual(E.finalizeOutcome(up, up.challengedAt + E.VOTE_WINDOW_MS),
+      { status: 'resolved', resolvedOptionId: null, eventAt: NOW + 2 * DAY_MS });
+    assert.equal(E.finalizeOutcome({ ...up, votesUphold: 0 }, up.challengedAt + E.VOTE_WINDOW_MS).status, 'void');
+  });
+  test('a reported timer does not expire', () => {
+    const t = { ...timerMarket(), status: 'reported', reportedEventAt: NOW, reportedAt: NOW + 9 * DAY_MS };
+    assert.equal(E.finalizeOutcome(t, t.expiresAt + 1), null);
   });
   test('pool with no stake on the reported option is void', () => {
     const m = reported({ optionTotals: { a: 0, b: 50 }, totalPool: 50 });
@@ -495,6 +502,59 @@ describe('betClaim', () => {
     assert.deepEqual(E.betClaim(bet(), resolvedPool, taxedP, NOW), { status: 'won', payout: 400 - 75, taxed: 75 });
     // losing and void are never taxed
     assert.equal(E.betClaim(bet({ optionId: 'b' }), resolvedFixed, taxedP, NOW).taxed, 0);
+  });
+});
+
+describe('betClaim: timer markets (per-bet windows)', () => {
+  const PLACED = NOW + 3 * HOUR_MS;
+  const tm = (over = {}) => timerMarket({ status: 'resolved', resolvedOptionId: null, eventAt: PLACED + HOUR_MS, ...over });
+  const tb = (optionId, over = {}) => bet({ optionId, placedAt: PLACED, odds: { d1: 6, d4: 3, d8: 1.8, never: 1.3 }[optionId], ...over });
+  const claim = (b, m, p = player()) => E.betClaim(b, m, p, NOW);
+
+  test('event inside the bet\'s own window wins at the locked odds; other buckets lose', () => {
+    // event 1h after the bet => d1
+    assert.deepEqual(claim(tb('d1'), tm()), { status: 'won', payout: 600, taxed: 0 });
+    for (const o of ['d4', 'd8', 'never']) assert.equal(claim(tb(o), tm()).status, 'lost');
+    // event 2 days after the bet => d4
+    const m = tm({ eventAt: PLACED + 2 * DAY_MS });
+    assert.deepEqual(claim(tb('d4'), m), { status: 'won', payout: 300, taxed: 0 });
+    assert.equal(claim(tb('d1'), m).status, 'lost');
+  });
+
+  test('boundaries: eventAt == placedAt is in d1; == placedAt + toMs moves to the next bucket', () => {
+    assert.equal(claim(tb('d1'), tm({ eventAt: PLACED })).status, 'won');
+    assert.equal(claim(tb('d1'), tm({ eventAt: PLACED + DAY_MS - 1 })).status, 'won');
+    assert.equal(claim(tb('d1'), tm({ eventAt: PLACED + DAY_MS })).status, 'lost');
+    assert.equal(claim(tb('d4'), tm({ eventAt: PLACED + DAY_MS })).status, 'won');
+    assert.equal(claim(tb('d4'), tm({ eventAt: PLACED + 4 * DAY_MS - 1 })).status, 'won');
+    assert.equal(claim(tb('d8'), tm({ eventAt: PLACED + 4 * DAY_MS })).status, 'won');
+    assert.equal(claim(tb('never'), tm({ eventAt: PLACED + 8 * DAY_MS })).status, 'won');
+    assert.equal(claim(tb('never'), tm({ eventAt: PLACED + 8 * DAY_MS - 1 })).status, 'lost');
+    assert.equal(claim(tb('never'), tm({ eventAt: PLACED + 80 * DAY_MS })).payout, 130);
+  });
+
+  test('event before the bet was placed => refund (void), never taxed', () => {
+    const m = tm({ eventAt: PLACED - 1 });
+    const p = player({ penaltyUntil: NOW + DAY_MS });
+    for (const o of ['d1', 'd4', 'never']) assert.deepEqual(claim(tb(o), m, p), { status: 'void', payout: 100, taxed: 0 });
+    // eventAt == placedAt is NOT before the bet
+    assert.equal(claim(tb('d1'), tm({ eventAt: PLACED }), p).status, 'won');
+  });
+
+  test('expiry with no event: only the open-ended bucket wins', () => {
+    const m = tm({ eventAt: null, resolvedOptionId: 'never' });
+    assert.deepEqual(claim(tb('never'), m), { status: 'won', payout: 130, taxed: 0 });
+    for (const o of ['d1', 'd4', 'd8']) assert.deepEqual(claim(tb(o), m), { status: 'lost', payout: 0, taxed: 0 });
+  });
+
+  test('void market (overturned / tied dispute) refunds', () => {
+    assert.deepEqual(claim(tb('d1'), tm({ status: 'void', eventAt: null })), { status: 'void', payout: 100, taxed: 0 });
+  });
+
+  test('tax rule unchanged: profit only, while the penalty is active', () => {
+    const p = player({ penaltyUntil: NOW + 1 });
+    assert.deepEqual(claim(tb('d1'), tm(), p), { status: 'won', payout: 600 - 125, taxed: 125 }); // floor(500 * .25)
+    assert.deepEqual(E.betClaim(tb('d1'), tm(), p, NOW + 1), { status: 'won', payout: 600, taxed: 0 });
   });
 });
 
@@ -583,7 +643,7 @@ describe('buildCustomMarket', () => {
     const m = E.buildCustomMarket(args({ kind: 'timer', closesAt: undefined, optionLabels: undefined }));
     assert.equal(m.mode, 'fixed');
     assert.equal(m.closesAt, NOW + 12 * HOUR_MS);
-    assert.equal(m.expiresAt, NOW + 8 * DAY_MS);
+    assert.equal(m.expiresAt, NOW + 12 * HOUR_MS + 8 * DAY_MS);
     assert.equal(m.expiryOptionId, 'never');
     assert.equal(m.reportableAt, NOW);
     assert.equal(E.validateCreateMarket(player(), m, NOW), null);

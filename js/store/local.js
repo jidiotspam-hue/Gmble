@@ -408,7 +408,7 @@ export function createLocalStore(options = {}) {
         status: 'reported',
         reportedBy: uid,
         reportedByName: player.username,
-        reportedOptionId: optionId,
+        reportedOptionId: isTimer ? null : optionId,
         reportedEventAt: isTimer ? evt : null,
         reportedAt: now,
         evidence: evidence || null,
