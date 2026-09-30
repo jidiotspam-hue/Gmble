@@ -50,7 +50,7 @@ determined player could edit balances from the dev console. Don't use it with st
 No build step and no dependencies.
 ```sh
 python3 -m http.server 8000   # then open http://localhost:8000
-node --test tests/            # run the unit tests (Node 20+)
+node --test                   # run the unit tests (Node 20+)
 ```
 - `js/economy.js`: all game rules (pure functions)
 - `js/templates.js`: the auto-generated house markets. Add your own templates here!

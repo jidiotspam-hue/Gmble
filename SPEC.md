@@ -14,7 +14,7 @@ js/store/index.js       # picks backend: firebase if FIREBASE_CONFIG else local;
 js/store/local.js       # localStorage backend
 js/store/firebase.js    # Firestore + Firebase Auth backend (loaded from gstatic CDN)
 js/app.js (+ js/ui/*.js) # UI
-tests/*.test.mjs        # `node --test tests/` must pass (Node 20+, no deps)
+tests/*.test.mjs        # `node --test` must pass (Node 20+, no deps)
 firestore.rules, README.md, .github/workflows/pages.yml
 ```
 
