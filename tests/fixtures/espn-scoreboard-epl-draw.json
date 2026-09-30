@@ -1,0 +1,174 @@
+{
+ "leagues": [
+  {
+   "id": "700",
+   "name": "English Premier League",
+   "abbreviation": "EPL",
+   "slug": "eng.1"
+  }
+ ],
+ "day": {
+  "date": "2026-10-03"
+ },
+ "events": [
+  {
+   "id": "740001",
+   "uid": "s:40~l:46~e:740001",
+   "date": "2026-10-03T14:00Z",
+   "name": "Arsenal at Liverpool",
+   "shortName": "ARS @ LIV",
+   "season": {
+    "year": 2027,
+    "type": 2,
+    "slug": "regular-season"
+   },
+   "competitions": [
+    {
+     "id": "740001",
+     "uid": "s:40~l:46~e:740001~c:740001",
+     "date": "2026-10-03T14:00Z",
+     "attendance": 0,
+     "type": {
+      "id": "1",
+      "abbreviation": "STD"
+     },
+     "timeValid": true,
+     "neutralSite": false,
+     "conferenceCompetition": false,
+     "playByPlayAvailable": true,
+     "recent": false,
+     "venue": {
+      "id": "1",
+      "fullName": "Some Arena",
+      "address": {
+       "city": "Somewhere",
+       "state": "XX"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "id": "364",
+       "uid": "s:40~l:46~t:364",
+       "type": "team",
+       "order": 0,
+       "homeAway": "home",
+       "winner": false,
+       "team": {
+        "id": "364",
+        "uid": "s:40~l:46~t:364",
+        "location": "Liverpool",
+        "name": "Liverpool",
+        "abbreviation": "LIV",
+        "displayName": "Liverpool Liverpool",
+        "shortDisplayName": "Liverpool",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/liv.png"
+       },
+       "score": "2",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "3-1-1"
+        }
+       ]
+      },
+      {
+       "id": "359",
+       "uid": "s:40~l:46~t:359",
+       "type": "team",
+       "order": 1,
+       "homeAway": "away",
+       "winner": false,
+       "team": {
+        "id": "359",
+        "uid": "s:40~l:46~t:359",
+        "location": "Arsenal",
+        "name": "Arsenal",
+        "abbreviation": "ARS",
+        "displayName": "Arsenal Arsenal",
+        "shortDisplayName": "Arsenal",
+        "color": "007ac1",
+        "alternateColor": "ef3b24",
+        "isActive": true,
+        "logo": "https://a.espncdn.com/i/teamlogos/nba/500/ars.png"
+       },
+       "score": "2",
+       "linescores": [],
+       "statistics": [],
+       "records": [
+        {
+         "name": "overall",
+         "abbreviation": "total",
+         "type": "total",
+         "summary": "3-1-1"
+        }
+       ]
+      }
+     ],
+     "notes": [],
+     "status": {
+      "clock": 0,
+      "displayClock": "0.0",
+      "period": 4,
+      "type": {
+       "id": "3",
+       "name": "STATUS_FULL_TIME",
+       "state": "post",
+       "completed": true,
+       "description": "FT",
+       "detail": "FT",
+       "shortDetail": "FT"
+      }
+     },
+     "broadcasts": [],
+     "odds": [
+      {
+       "provider": {
+        "id": "58",
+        "name": "ESPN BET",
+        "priority": 1
+       },
+       "details": "LIV +110",
+       "overUnder": 2.5,
+       "homeTeamOdds": {
+        "favorite": false,
+        "underdog": false,
+        "moneyLine": 125
+       },
+       "awayTeamOdds": {
+        "favorite": false,
+        "underdog": false,
+        "moneyLine": 220
+       },
+       "drawOdds": {
+        "moneyLine": 245
+       }
+      }
+     ]
+    }
+   ],
+   "links": [],
+   "status": {
+    "clock": 0,
+    "displayClock": "0.0",
+    "period": 4,
+    "type": {
+     "id": "3",
+     "name": "STATUS_FULL_TIME",
+     "state": "post",
+     "completed": true,
+     "description": "FT",
+     "detail": "FT",
+     "shortDetail": "FT"
+    }
+   }
+  }
+ ]
+}

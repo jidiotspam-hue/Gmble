@@ -1,0 +1,67 @@
+{
+ "items": [
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092400",
+   "access": "all-access",
+   "agent": "user",
+   "views": 88110
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092500",
+   "access": "all-access",
+   "agent": "user",
+   "views": 90340
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092600",
+   "access": "all-access",
+   "agent": "user",
+   "views": 85220
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092700",
+   "access": "all-access",
+   "agent": "user",
+   "views": 93010
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092800",
+   "access": "all-access",
+   "agent": "user",
+   "views": 89200
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026092900",
+   "access": "all-access",
+   "agent": "user",
+   "views": 87510
+  },
+  {
+   "project": "en.wikipedia",
+   "article": "Elon_Musk",
+   "granularity": "daily",
+   "timestamp": "2026093000",
+   "access": "all-access",
+   "agent": "user",
+   "views": 91800
+  }
+ ]
+}

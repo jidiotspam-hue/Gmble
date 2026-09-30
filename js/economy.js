@@ -1,5 +1,6 @@
-// Sonnetous economy: PURE game rules. No DOM, no storage. Importable from Node.
-// Nothing here mutates its inputs; functions return new objects / patches.
+// Sonnetous economy v2: PURE game rules. No DOM, no storage. Importable from Node.
+// Nothing here mutates its inputs; functions return new objects / patches / error strings.
+// The payout math (betClaim, bondClaims) is mirrored by firestore.rules — keep them in lock-step.
 
 export const CURRENCY = Object.freeze({ name: 'sonnetous', symbol: '§' });
 export const STARTING_BALANCE = 500;
@@ -10,6 +11,16 @@ export const HOUR_MS = 3_600_000;
 export const PENALTY_DAYS = 3;
 export const PENALTY_TAX = 0.25;
 export const DEFAULT_TIMER_CLOSE_HOURS = 12;
+
+export const BOND = 20;
+export const CHALLENGE_WINDOW_MS = 12 * HOUR_MS;
+export const VOTE_WINDOW_MS = 24 * HOUR_MS;
+export const BET_COOLDOWN_MS = 2000;
+export const MAX_MARKETS_PER_DAY = 5;
+export const MIN_FIXED_ODDS = 1.01;
+export const MAX_FIXED_ODDS = 20;
+export const CLOCK_SKEW_MS = 300000;
+export const MAX_EVIDENCE_LENGTH = 300;
 
 export const DEFAULT_TIMER_BUCKETS = Object.freeze([
   Object.freeze({ id: 'd1', label: 'Within 1 day', odds: 6, fromDays: 0, toDays: 1 }),
@@ -22,6 +33,8 @@ export const DEFAULT_TIMER_BUCKETS = Object.freeze([
 
 const pad = (n) => String(n).padStart(2, '0');
 const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
+const isInt = (n) => typeof n === 'number' && Number.isInteger(n);
+const has = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k) && o[k] !== undefined;
 const zeroTotals = (options) => Object.fromEntries(options.map((o) => [o.id, 0]));
 
 /** Local-time calendar day key YYYY-MM-DD. */
@@ -36,6 +49,11 @@ export function utcDayKey(ms = Date.now()) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
+/** Whole UTC days since the epoch. */
+export function utcDayNumber(ms) {
+  return Math.floor(ms / DAY_MS);
+}
+
 /** 1234 -> '§1,234'; -5 -> '-§5'. Fractions are rounded. */
 export function formatSonnetous(n) {
   const v = Math.round(Number(n) || 0);
@@ -43,18 +61,106 @@ export function formatSonnetous(n) {
   return `${v < 0 ? '-' : ''}${CURRENCY.symbol}${s}`;
 }
 
-export function newUser(uid, username, now) {
+/** null when the username is acceptable, else a friendly message. */
+export function validateUsername(username) {
+  if (typeof username !== 'string' || !/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+    return 'Username must be 3–20 characters: letters, numbers and underscores only.';
+  }
+  return null;
+}
+
+export function newPlayer(uid, username, now) {
   return {
     uid,
     username,
     balance: STARTING_BALANCE,
+    openStake: 0,
     createdAt: now,
     bankruptcies: 0,
     brokeSince: null,
     penaltyUntil: null,
     totalWagered: 0,
     totalWon: 0,
+    lastBetAt: 0,
+    marketsDay: 0,
+    marketsCount: 0,
+    lastClaimId: null,
+    lastBondMarketId: null,
   };
+}
+
+/** @deprecated v1 name; returns a v2 Player. */
+export const newUser = newPlayer;
+
+const optionIdsOf = (market) =>
+  Array.isArray(market.optionIds) ? market.optionIds : (market.options || []).map((o) => o.id);
+
+// ---------------------------------------------------------------- market normalisation
+
+/**
+ * Fills every derived / defaulted v2 field of a market (never mutates the input, never overwrites a
+ * field that is already present). Used by buildCustomMarket and templates.buildAutoMarket.
+ */
+export function normalizeMarket(m) {
+  const out = { ...m };
+  delete out.resolvedBy; // v1 field, not part of the v2 shape
+  out.options = (m.options || []).map((o) => ({ ...o }));
+  const options = out.options;
+  if (!has(out, 'type')) out.type = out.createdBy === 'house' ? 'auto' : 'custom';
+  if (!has(out, 'templateId')) out.templateId = null;
+  if (!has(out, 'description')) out.description = '';
+  if (!has(out, 'mode')) {
+    out.mode = out.kind === 'timer' || (options.length && options.every((o) => isNum(o.odds))) ? 'fixed' : 'pool';
+  }
+  if (!has(out, 'status')) out.status = 'open';
+  if (!has(out, 'oracle')) out.oracle = null;
+
+  out.optionIds = Array.isArray(m.optionIds) ? [...m.optionIds] : options.map((o) => o.id);
+  if (has(m, 'oddsById')) out.oddsById = m.oddsById === null ? null : { ...m.oddsById };
+  else out.oddsById = out.mode === 'fixed' ? Object.fromEntries(options.map((o) => [o.id, o.odds])) : null;
+
+  if (out.kind === 'timer') {
+    if (has(m, 'bucketsById')) out.bucketsById = m.bucketsById === null ? null : { ...m.bucketsById };
+    else {
+      out.bucketsById = Object.fromEntries(options.map((o) => [o.id, {
+        fromMs: Math.round((isNum(o.fromDays) ? o.fromDays : 0) * DAY_MS),
+        toMs: o.toDays == null ? null : Math.round(o.toDays * DAY_MS),
+      }]));
+    }
+    const buckets = out.bucketsById || {};
+    if (!has(m, 'expiresAt')) {
+      const finite = Object.values(buckets).map((b) => b.toMs).filter((t) => t != null);
+      const hasOpenEnded = Object.values(buckets).some((b) => b.toMs == null);
+      // the last possible bet (placed just before closesAt) must see its whole longest window elapse
+      out.expiresAt = hasOpenEnded && finite.length && isNum(out.closesAt) ? out.closesAt + Math.max(...finite) : null;
+    }
+    if (!has(m, 'expiryOptionId')) {
+      const open = Object.entries(buckets).find(([, b]) => b.toMs == null);
+      out.expiryOptionId = open ? open[0] : null;
+    }
+    if (!has(m, 'reportableAt')) out.reportableAt = out.openedAt;
+  } else {
+    if (!has(m, 'bucketsById')) out.bucketsById = null;
+    if (!has(m, 'expiresAt')) out.expiresAt = null;
+    if (!has(m, 'expiryOptionId')) out.expiryOptionId = null;
+    if (!has(m, 'reportableAt')) {
+      out.reportableAt = out.oracle && out.oracle.params && isNum(out.oracle.params.at)
+        ? out.oracle.params.at : out.closesAt;
+    }
+  }
+
+  out.optionTotals = has(m, 'optionTotals') ? { ...m.optionTotals } : zeroTotals(options);
+  const defaults = {
+    totalPool: 0, betCount: 0, lastBetId: null,
+    reportedBy: null, reportedByName: null, reportedOptionId: null, reportedEventAt: null, reportedAt: null,
+    evidence: null,
+    challengedBy: null, challengedByName: null, challengedAt: null,
+    votesUphold: 0, votesOverturn: 0, lastVoteId: null,
+    resolvedOptionId: null, resolvedAt: null, eventAt: null,
+    reporterBondPaid: false, challengerBondPaid: false,
+  };
+  for (const [k, v] of Object.entries(defaults)) if (!has(m, k)) out[k] = v;
+  return out;
 }
 
 // ---------------------------------------------------------------- market state
@@ -63,26 +169,29 @@ export function isBettingOpen(market, now) {
   return !!market && market.status === 'open' && now < market.closesAt;
 }
 
+/** 'closed' = still 'open' in the database but betting time is over (awaiting a report / expiry). */
 export function marketPhase(market, now) {
-  if (market.status === 'resolved') return 'resolved';
-  if (market.status === 'void') return 'void';
-  return now >= market.closesAt ? 'awaiting' : 'open';
+  if (market.status === 'open') return now >= market.closesAt ? 'closed' : 'open';
+  return market.status;
 }
+
+const isFinal = (market) => market.status === 'resolved' || market.status === 'void';
 
 // ---------------------------------------------------------------- betting
 
-export function validateBet(user, market, optionId, amount, now) {
-  if (!user) return 'Log in to place a bet';
+export function validateBet(player, market, optionId, amount, now) {
+  if (!player) return 'Log in to place a bet';
   if (!market) return 'Market not found';
   if (market.status === 'resolved') return 'This market has already been resolved';
   if (market.status === 'void') return 'This market was voided';
+  if (market.status === 'reported' || market.status === 'challenged') return 'Betting is closed — a result has been reported';
   if (market.status !== 'open') return 'This market is not open';
   if (!(now < market.closesAt)) return 'Betting is closed for this market';
-  const option = (market.options || []).find((o) => o.id === optionId);
-  if (!option) return 'Unknown option';
-  if (typeof amount !== 'number' || !Number.isInteger(amount)) return 'Bet must be a whole number of sonnetous';
+  if (!optionIdsOf(market).includes(optionId)) return 'Unknown option';
+  if (!isInt(amount)) return 'Bet must be a whole number of sonnetous';
   if (amount < MIN_BET) return `Minimum bet is ${formatSonnetous(MIN_BET)}`;
-  if (amount > user.balance) return 'Not enough sonnetous';
+  if (amount > player.balance) return 'Not enough sonnetous';
+  if (now < (player.lastBetAt || 0) + BET_COOLDOWN_MS) return 'Slow down — one bet every 2 seconds';
   return null;
 }
 
@@ -95,9 +204,10 @@ export function potentialPayout(market, optionId, amount) {
     const pool = market.totalPool || 0;
     return Math.floor((amount * (pool + amount)) / (optTotal + amount));
   }
-  if (!option || !isNum(option.odds)) return 0;
+  const odds = market.oddsById && isNum(market.oddsById[optionId]) ? market.oddsById[optionId] : option && option.odds;
+  if (!isNum(odds)) return 0;
   // epsilon guards against float error such as 100 * 1.15 = 114.99999999999999
-  return Math.floor(amount * option.odds + 1e-9);
+  return Math.floor(amount * odds + 1e-9);
 }
 
 export function displayOdds(market, optionId) {
@@ -107,37 +217,102 @@ export function displayOdds(market, optionId) {
     return (market.totalPool || 0) / optTotal;
   }
   const option = (market.options || []).find((o) => o.id === optionId);
-  return option && isNum(option.odds) ? option.odds : null;
+  const odds = market.oddsById && isNum(market.oddsById[optionId]) ? market.oddsById[optionId] : option && option.odds;
+  return isNum(odds) ? odds : null;
 }
 
-export function buildBet({ id, market, user, optionId, amount, now }) {
+export function buildBet({ id, market, player, user, optionId, amount, now }) {
+  const p = player || user;
   const option = (market.options || []).find((o) => o.id === optionId);
+  let odds = null;
+  if (market.mode === 'fixed') {
+    const o = market.oddsById && isNum(market.oddsById[optionId]) ? market.oddsById[optionId] : option && option.odds;
+    odds = isNum(o) ? o : null;
+  }
   return {
     id,
     marketId: market.id,
     marketTitle: market.title,
-    uid: user.uid,
-    username: user.username,
+    uid: p.uid,
+    username: p.username,
     optionId,
     optionLabel: option ? option.label : optionId,
     amount,
-    odds: market.mode === 'fixed' && option && isNum(option.odds) ? option.odds : null,
+    odds,
     placedAt: now,
     status: 'open',
     payout: 0,
     taxed: 0,
+    claimedAt: null,
   };
 }
 
-/** Returns a patch { optionTotals, totalPool, betCount } without mutating the market. */
-export function applyBetToMarket(market, optionId, amount) {
+/** Patch { optionTotals, totalPool, betCount, lastBetId? } for a new bet; does not mutate the market. */
+export function applyBetToMarket(market, optionId, amount, betId) {
   const optionTotals = { ...(market.optionTotals || {}) };
   optionTotals[optionId] = (optionTotals[optionId] || 0) + amount;
-  return {
+  const patch = {
     optionTotals,
     totalPool: (market.totalPool || 0) + amount,
     betCount: (market.betCount || 0) + 1,
   };
+  if (betId !== undefined) patch.lastBetId = betId;
+  return patch;
+}
+
+// ---------------------------------------------------------------- market creation
+
+/** Player patch to apply when the player creates a custom market. */
+export function marketCreationPatch(player, now) {
+  const today = utcDayNumber(now);
+  return {
+    marketsDay: today,
+    marketsCount: (player.marketsDay === today ? player.marketsCount || 0 : 0) + 1,
+  };
+}
+
+export function validateCreateMarket(player, market, now) {
+  if (!player) return 'Log in to create a market';
+  if (!market) return 'Invalid market';
+  const house = market.createdBy === 'house' || market.type === 'auto';
+  if (house) {
+    if (market.createdBy !== 'house' || market.type !== 'auto') return 'Invalid market';
+    if (!/^auto-\d{4}-\d{2}-\d{2}-.+/.test(String(market.id || ''))) return 'Invalid house market id';
+  } else {
+    if (market.createdBy !== player.uid) return 'You can only create markets as yourself';
+    if (player.marketsDay === utcDayNumber(now) && (player.marketsCount || 0) >= MAX_MARKETS_PER_DAY) {
+      return `You can only create ${MAX_MARKETS_PER_DAY} markets per day`;
+    }
+  }
+  const title = String(market.title ?? '');
+  if (title.trim().length < 3) return 'Title must be at least 3 characters';
+  if (title.length > 140) return 'Title must be at most 140 characters';
+  if (market.kind !== 'timer' && market.kind !== 'choice') return 'Market kind must be "choice" or "timer"';
+  const options = market.options || [];
+  if (options.length < 2 || options.length > 6) return 'A market needs 2–6 options';
+  if (new Set(options.map((o) => o.id)).size !== options.length) return 'Option ids must be unique';
+  if (market.status !== 'open') return 'New markets must be open';
+  if (!isNum(market.openedAt) || Math.abs(market.openedAt - now) > CLOCK_SKEW_MS) {
+    return 'Your clock looks off — check your device time';
+  }
+  if (!isNum(market.closesAt) || !(market.closesAt > now)) return 'Closing time must be in the future';
+  if (market.kind === 'choice' && !house && market.mode !== 'pool') return 'Custom choice markets are pool markets';
+  if (market.kind === 'timer' && market.mode !== 'fixed') return 'Timer markets use fixed odds';
+  if (market.mode === 'fixed') {
+    for (const o of options) {
+      const odds = market.oddsById ? market.oddsById[o.id] : o.odds;
+      if (!isNum(odds) || odds < MIN_FIXED_ODDS || odds > MAX_FIXED_ODDS) {
+        return `Odds must be between ${MIN_FIXED_ODDS} and ${MAX_FIXED_ODDS}`;
+      }
+    }
+  } else if (market.mode !== 'pool') {
+    return 'Invalid market mode';
+  }
+  if ((market.totalPool || 0) !== 0 || (market.betCount || 0) !== 0
+    || Object.values(market.optionTotals || {}).some((v) => v !== 0)) {
+    return 'New markets must start with an empty pool';
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------- timers
@@ -157,118 +332,187 @@ export function timerBucketFor(market, eventAt) {
   return (hit || options[options.length - 1]).id;
 }
 
-/** Open-ended bucket id when an open timer market has outlasted its longest finite bucket, else null. */
+/** Open-ended bucket id when an open timer market has outlasted closesAt + its longest finite bucket, else null. */
 export function timerAutoResolution(market, now) {
   if (!market || market.kind !== 'timer' || market.status !== 'open') return null;
+  if (isNum(market.expiresAt) && market.expiryOptionId) return now >= market.expiresAt ? market.expiryOptionId : null;
   const options = market.options || [];
   const openEnded = options.find((o) => o.toDays == null);
   if (!openEnded) return null;
   const finite = options.filter((o) => o.toDays != null).map((o) => o.toDays);
   const maxFinite = finite.length ? Math.max(...finite) : 0;
-  return now >= market.openedAt + maxFinite * DAY_MS ? openEnded.id : null;
+  return now >= (isNum(market.closesAt) ? market.closesAt : market.openedAt) + maxFinite * DAY_MS ? openEnded.id : null;
 }
 
-// ---------------------------------------------------------------- settlement
+// ---------------------------------------------------------------- report / challenge / vote
 
-function openBetsOf(market, bets) {
-  return (bets || []).filter((b) => b && b.marketId === market.id && b.status === 'open');
-}
-
-/** Everyone refunded, status 'void'. */
-export function voidMarket(market, bets, now, resolvedBy) {
-  const betPatches = {};
-  const userDeltas = {};
-  for (const b of openBetsOf(market, bets)) {
-    betPatches[b.id] = { status: 'void', payout: b.amount, taxed: 0 };
-    const d = (userDeltas[b.uid] ||= { balance: 0, totalWon: 0 });
-    d.balance += b.amount;
+export function validateReport(player, market, optionId, eventAt, now) {
+  if (!player) return 'Log in to report a result';
+  if (!market) return 'Market not found';
+  if (market.status === 'reported' || market.status === 'challenged') return 'A result has already been reported';
+  if (market.status === 'resolved') return 'This market has already been resolved';
+  if (market.status === 'void') return 'This market was voided';
+  if (market.status !== 'open') return 'This market is not open';
+  if (market.type === 'custom' && market.createdBy !== player.uid) return 'Only the creator can report this market';
+  if (!isNum(market.reportableAt) || now < market.reportableAt) return "It's too early to report a result for this market";
+  if (market.kind === 'timer') {
+    // timer reports carry only the event time; each bet is judged against its own placedAt
+    if (!isNum(eventAt)) return 'Say when it happened';
+    if (eventAt < market.openedAt) return "The event can't be before the market opened";
+    if (eventAt > now) return "The event can't be in the future";
+  } else if (!optionIdsOf(market).includes(optionId)) {
+    return 'Unknown option';
   }
-  return {
-    marketPatch: { status: 'void', resolvedOptionId: null, resolvedAt: now, resolvedBy },
-    betPatches,
-    userDeltas,
+  if (player.balance < BOND) return `Not enough sonnetous for the ${formatSonnetous(BOND)} bond`;
+  return null;
+}
+
+export function validateChallenge(player, market, now) {
+  if (!player) return 'Log in to challenge a result';
+  if (!market) return 'Market not found';
+  if (market.status === 'challenged') return 'This report has already been challenged';
+  if (market.status !== 'reported') return 'There is no reported result to challenge';
+  if (!(now < market.reportedAt + CHALLENGE_WINDOW_MS)) return 'The challenge window has closed';
+  if (market.reportedBy === player.uid) return "You can't challenge your own report";
+  if (player.balance < BOND) return `Not enough sonnetous for the ${formatSonnetous(BOND)} bond`;
+  return null;
+}
+
+export function validateVote(player, market, { hasStake = false, hasVoted = false } = {}, now) {
+  if (!player) return 'Log in to vote';
+  if (!market) return 'Market not found';
+  if (market.status !== 'challenged') return 'This market is not under dispute';
+  if (!(now < market.challengedAt + VOTE_WINDOW_MS)) return 'The voting window has closed';
+  if (hasStake) return "You bet on this market, so you can't vote";
+  if (player.uid === market.reportedBy || player.uid === market.challengedBy) {
+    return "You're part of this dispute, so you can't vote";
+  }
+  if (hasVoted) return "You've already voted";
+  return null;
+}
+
+// ---------------------------------------------------------------- finalisation & claims
+
+/**
+ * What finalize would do to this market right now (null = nothing yet). Pure; anyone may apply it.
+ * Void outcomes carry resolvedOptionId null / eventAt null.
+ */
+export function finalizeOutcome(market, now) {
+  if (!market) return null;
+  const VOID = { status: 'void', resolvedOptionId: null, eventAt: null };
+  const reportedResult = () => {
+    if (market.kind === 'timer') {
+      // per-bet windows: no winning option, betClaim judges every bet against eventAt
+      return { status: 'resolved', resolvedOptionId: null, eventAt: isNum(market.reportedEventAt) ? market.reportedEventAt : null };
+    }
+    if (market.mode === 'pool' && !((market.optionTotals || {})[market.reportedOptionId] > 0)) return VOID;
+    return {
+      status: 'resolved',
+      resolvedOptionId: market.reportedOptionId,
+      eventAt: isNum(market.reportedEventAt) ? market.reportedEventAt : null,
+    };
   };
+  if (market.status === 'open') {
+    if (market.kind === 'timer' && isNum(market.expiresAt) && market.expiryOptionId && now >= market.expiresAt) {
+      return { status: 'resolved', resolvedOptionId: market.expiryOptionId, eventAt: null };
+    }
+    return null;
+  }
+  if (market.status === 'reported') {
+    return now >= market.reportedAt + CHALLENGE_WINDOW_MS ? reportedResult() : null;
+  }
+  if (market.status === 'challenged') {
+    if (!(now >= market.challengedAt + VOTE_WINDOW_MS)) return null;
+    return (market.votesUphold || 0) > (market.votesOverturn || 0) ? reportedResult() : VOID;
+  }
+  return null;
 }
 
-export function settleMarket(market, bets, winningOptionId, usersById, now, resolvedBy, eventAt = null) {
-  if (!(market.options || []).some((o) => o.id === winningOptionId)) {
-    throw new Error('Unknown winning option');
-  }
-  const open = openBetsOf(market, bets);
-  const poolTotal = open.reduce((s, b) => s + b.amount, 0);
-  const winTotal = open.filter((b) => b.optionId === winningOptionId).reduce((s, b) => s + b.amount, 0);
+export function penaltyActive(player, now) {
+  return isNum(player.penaltyUntil) && player.penaltyUntil > now;
+}
 
-  if (market.mode === 'pool' && winTotal === 0) {
-    return voidMarket(market, bets, now, resolvedBy);
+/**
+ * Settlement of one bet against a final market.
+ * fixed gross = floor(amount*odds + 1e-9); pool gross = floor(amount*totalPool/optionTotals[winner]);
+ * tax = floor((gross-amount)*0.25) only when the player's penalty is active and gross > amount. Void refunds the stake.
+ */
+export function betClaim(bet, market, player, now) {
+  if (!market || !isFinal(market)) throw new Error('This market has not been settled yet');
+  if (market.status === 'void') return { status: 'void', payout: bet.amount, taxed: 0 };
+  const timerEvent = market.kind === 'timer' && isNum(market.eventAt);
+  if (timerEvent) {
+    // event reported: judged per bet. Event before the bet => refund; else the bet's window must contain it.
+    if (market.eventAt < bet.placedAt) return { status: 'void', payout: bet.amount, taxed: 0 };
+    const off = market.eventAt - bet.placedAt;
+    const b = market.bucketsById && market.bucketsById[bet.optionId];
+    if (!b || off < b.fromMs || (b.toMs != null && off >= b.toMs)) return { status: 'lost', payout: 0, taxed: 0 };
+  } else if (bet.optionId !== market.resolvedOptionId) {
+    // pool/choice result, or timer expiry with no event (only the open-ended bucket wins)
+    return { status: 'lost', payout: 0, taxed: 0 };
   }
+  let gross;
+  if (market.mode === 'pool') {
+    const winTotal = (market.optionTotals || {})[market.resolvedOptionId] || 0;
+    const num = bet.amount * (market.totalPool || 0);
+    gross = winTotal > 0 ? (num - (num % winTotal)) / winTotal : bet.amount;
+  } else {
+    let odds = bet.odds;
+    if (!isNum(odds)) odds = market.oddsById ? market.oddsById[bet.optionId] : null;
+    gross = Math.floor(bet.amount * (isNum(odds) ? odds : 1) + 1e-9);
+  }
+  let taxed = 0;
+  if (player && penaltyActive(player, now) && gross > bet.amount) {
+    taxed = Math.floor((gross - bet.amount) * PENALTY_TAX);
+  }
+  return { status: 'won', payout: gross - taxed, taxed };
+}
 
-  const betPatches = {};
-  const userDeltas = {};
-  for (const b of open) {
-    if (b.optionId !== winningOptionId) {
-      betPatches[b.id] = { status: 'lost', payout: 0, taxed: 0 };
-      continue;
-    }
-    let payout;
-    if (market.mode === 'pool') {
-      payout = Math.floor((b.amount * poolTotal) / winTotal);
-    } else {
-      payout = Math.floor(b.amount * (isNum(b.odds) ? b.odds : 1) + 1e-9);
-    }
-    let taxed = 0;
-    const u = usersById && usersById[b.uid];
-    if (u && isNum(u.penaltyUntil) && u.penaltyUntil > now && payout > b.amount) {
-      taxed = Math.floor((payout - b.amount) * PENALTY_TAX);
-      payout -= taxed;
-    }
-    betPatches[b.id] = { status: 'won', payout, taxed };
-    if (payout > 0) {
-      const d = (userDeltas[b.uid] ||= { balance: 0, totalWon: 0 });
-      d.balance += payout;
-      d.totalWon += payout;
-    }
-  }
-  return {
-    marketPatch: { status: 'resolved', resolvedOptionId: winningOptionId, resolvedAt: now, resolvedBy, eventAt },
-    betPatches,
-    userDeltas,
-  };
+/** What each bond holder is owed once the market is final (0/0 before that or when there is no bond). */
+export function bondClaims(market) {
+  const none = { reporter: 0, challenger: 0 };
+  if (!market || !isFinal(market) || !market.reportedBy) return none;
+  if (!market.challengedBy) return { reporter: BOND, challenger: 0 };
+  const up = market.votesUphold || 0;
+  const down = market.votesOverturn || 0;
+  if (up > down) return { reporter: 2 * BOND, challenger: 0 };
+  if (down > up) return { reporter: 0, challenger: 2 * BOND };
+  return { reporter: BOND, challenger: BOND };
 }
 
 // ---------------------------------------------------------------- wealth / bankruptcy
 
-export function netWorth(user, bets) {
-  const staked = (bets || [])
-    .filter((b) => b && b.uid === user.uid && b.status === 'open')
-    .reduce((s, b) => s + b.amount, 0);
-  return user.balance + staked;
+export function netWorth(player) {
+  return (player.balance || 0) + (player.openStake || 0);
 }
 
-export function isBroke(user, bets) {
-  if (user.balance >= MIN_BET) return false;
-  return !(bets || []).some((b) => b && b.uid === user.uid && b.status === 'open');
+export function isBroke(player) {
+  return player.balance < MIN_BET && (player.openStake || 0) === 0;
 }
 
-export function canClaimRestart(user, bets, now) {
-  return isBroke(user, bets) && !!user.brokeSince && user.brokeSince < dayKey(now);
+/** Earliest instant a bailout can be claimed: the UTC midnight after brokeSince. */
+export function restartAvailableAt(player) {
+  return isNum(player.brokeSince) ? (Math.floor(player.brokeSince / DAY_MS) + 1) * DAY_MS : null;
 }
 
-export function restartPatch(user, now) {
+export function canClaimRestart(player, now) {
+  const at = restartAvailableAt(player);
+  return isBroke(player) && at !== null && now >= at;
+}
+
+export function restartPatch(player, now) {
   return {
     balance: RESTART_BALANCE,
-    bankruptcies: (user.bankruptcies || 0) + 1,
+    bankruptcies: (player.bankruptcies || 0) + 1,
     brokeSince: null,
     penaltyUntil: now + PENALTY_DAYS * DAY_MS,
   };
 }
 
-export function penaltyActive(user, now) {
-  return isNum(user.penaltyUntil) && user.penaltyUntil > now;
-}
-
 // ---------------------------------------------------------------- custom markets
 
-export function buildCustomMarket({ id, user, now, title, description, kind, optionLabels, closesAt }) {
+export function buildCustomMarket({ id, player, user, now, title, description, kind, optionLabels, closesAt }) {
+  const p = player || user;
   const t = String(title ?? '').trim();
   if (t.length < 3) throw new Error('Title must be at least 3 characters');
   if (t.length > 140) throw new Error('Title must be at most 140 characters');
@@ -298,7 +542,7 @@ export function buildCustomMarket({ id, user, now, title, description, kind, opt
   }
   if (!(close > now)) throw new Error('Closing time must be in the future');
 
-  return {
+  return normalizeMarket({
     id,
     type: 'custom',
     templateId: null,
@@ -308,20 +552,50 @@ export function buildCustomMarket({ id, user, now, title, description, kind, opt
     description: String(description ?? '').trim(),
     category: 'Custom',
     emoji: kind === 'timer' ? '⏳' : '🎲',
-    createdBy: user.uid,
-    createdByName: user.username,
+    createdBy: p.uid,
+    createdByName: p.username,
     openedAt: now,
     closesAt: close,
     options,
-    optionTotals: zeroTotals(options),
-    totalPool: 0,
-    betCount: 0,
-    status: 'open',
-    resolvedOptionId: null,
-    resolvedAt: null,
-    resolvedBy: null,
-    eventAt: null,
-  };
+  });
+}
+
+// ---------------------------------------------------------------- house market audit
+
+/**
+ * Compares a stored house market with the deterministic template-built one. Returns a description of the
+ * first difference, or null when they match. openedAt/closesAt may differ (different builder clocks), so
+ * only the betting-window LENGTH is compared. For oracle markets the title / labels / params embed a
+ * baseline computed at creation, so only structure (kind, mode, option ids, odds, buckets, oracle type) is compared.
+ */
+export function houseMarketMismatch(market, expected) {
+  if (!market || !expected) return 'Market missing';
+  const oracle = !!(expected.oracle || market.oracle);
+  if (market.createdBy !== 'house') return 'Not created by the house';
+  if (market.type !== 'auto') return 'Wrong market type';
+  if (market.kind !== expected.kind) return 'Kind differs from the template';
+  if (market.mode !== expected.mode) return 'Mode differs from the template';
+  if (!oracle && market.title !== expected.title) return 'Title differs from the template';
+  if (oracle && (!market.oracle || !expected.oracle || market.oracle.type !== expected.oracle.type)) {
+    return 'Oracle differs from the template';
+  }
+  const a = (market.options || []).map((o) => o.id).join('|');
+  const b = (expected.options || []).map((o) => o.id).join('|');
+  if (a !== b) return 'Options differ from the template';
+  for (const o of expected.options || []) {
+    const mine = (market.options || []).find((x) => x.id === o.id);
+    if (!oracle && mine.label !== o.label) return 'Option labels differ from the template';
+    const mo = market.oddsById ? market.oddsById[o.id] : mine.odds;
+    const eo = expected.oddsById ? expected.oddsById[o.id] : o.odds;
+    if ((mo ?? null) !== (eo ?? null)) return 'Odds differ from the template';
+  }
+  if (JSON.stringify(market.bucketsById ?? null) !== JSON.stringify(expected.bucketsById ?? null)) {
+    return 'Time buckets differ from the template';
+  }
+  if (market.closesAt - market.openedAt !== expected.closesAt - expected.openedAt) {
+    return 'Betting window differs from the template';
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------- PRNG

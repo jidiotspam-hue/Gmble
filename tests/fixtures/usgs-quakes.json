@@ -1,0 +1,135 @@
+{
+ "type": "FeatureCollection",
+ "metadata": {
+  "generated": 1791018000000,
+  "url": "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&eventtype=earthquake&minmagnitude=6.5&starttime=2026-09-30T12:00:00&orderby=time-asc&limit=20",
+  "title": "USGS Earthquakes",
+  "status": 200,
+  "api": "1.14.1",
+  "limit": 20,
+  "offset": 1,
+  "count": 3
+ },
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 7.1,
+    "place": "92 km WSW of Ovalle, Chile",
+    "time": 1790916070500,
+    "updated": 1790919670500,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000zzz2",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=us7000zzz2&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1646,
+    "net": "us",
+    "code": "7000zzz2",
+    "ids": ",us7000zzz2,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "earthquake",
+    "title": "M 7.1 - 92 km WSW of Ovalle, Chile"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "us7000zzz2"
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 6.6,
+    "place": "10 km NE of Kamishihoro, Japan",
+    "time": 1790867564120,
+    "updated": 1790871164120,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000zzz1",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=us7000zzz1&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1322,
+    "net": "us",
+    "code": "7000zzz1",
+    "ids": ",us7000zzz1,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "earthquake",
+    "title": "M 6.6 - 10 km NE of Kamishihoro, Japan"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "us7000zzz1"
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "mag": 6.9,
+    "place": "Kermadec Islands region",
+    "time": 1790989200000,
+    "updated": 1790992800000,
+    "tz": null,
+    "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000zzz3",
+    "detail": "https://earthquake.usgs.gov/fdsnws/event/1/query?eventid=us7000zzz3&format=geojson",
+    "felt": null,
+    "cdi": null,
+    "mmi": null,
+    "alert": null,
+    "status": "reviewed",
+    "tsunami": 0,
+    "sig": 1511,
+    "net": "us",
+    "code": "7000zzz3",
+    "ids": ",us7000zzz3,",
+    "sources": ",us,",
+    "types": ",origin,phase-data,",
+    "nst": 96,
+    "dmin": 2.1,
+    "rms": 0.9,
+    "gap": 31,
+    "magType": "mww",
+    "type": "earthquake",
+    "title": "M 6.9 - Kermadec Islands region"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -71.4193,
+     -31.6432,
+     38.5
+    ]
+   },
+   "id": "us7000zzz3"
+  }
+ ]
+}

@@ -3,116 +3,181 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0f0d">
+  <meta name="theme-color" content="#090b10">
   <meta name="color-scheme" content="dark">
-  <meta name="description" content="Sonnetous — bet a fake currency on anything with your friends. Bet on anything. Lose everything. Try again tomorrow.">
+  <meta name="description" content="Sonnetous — a play-money prediction market for friends. Bet on anything. Lose everything. Try again tomorrow.">
   <title>Sonnetous</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B0%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3CradialGradient id='g' cx='.35' cy='.3' r='.8'%3E%3Cstop offset='0' stop-color='%23ffe9a8'/%3E%3Cstop offset='.5' stop-color='%23f5c451'/%3E%3Cstop offset='1' stop-color='%23c98a16'/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='30' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='23' fill='none' stroke='%231c1405' stroke-opacity='.25' stroke-width='2'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-family='Georgia,serif' font-weight='700' font-size='34' fill='%231c1405'%3E%C2%A7%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&family=Inter:wght@400;500;600;700;800;900&display=swap">
   <link rel="stylesheet" href="css/styles.css">
   <script type="module" src="js/app.js"></script>
 </head>
 <body>
-  <noscript><p class="fatal-static">Sonnetous needs JavaScript. Sorry, gamblers.</p></noscript>
+  <!-- inline SVG sprite -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <radialGradient id="coin-g" cx=".35" cy=".3" r=".85">
+        <stop offset="0" stop-color="#ffeab0"/>
+        <stop offset=".45" stop-color="#f5c451"/>
+        <stop offset="1" stop-color="#c7891a"/>
+      </radialGradient>
+      <linearGradient id="coin-edge" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#fff2c7"/>
+        <stop offset="1" stop-color="#a86f0e"/>
+      </linearGradient>
+    </defs>
+    <symbol id="logo" viewBox="0 0 64 64">
+      <circle cx="32" cy="32" r="30" fill="url(#coin-edge)"/>
+      <circle cx="32" cy="32" r="27" fill="url(#coin-g)"/>
+      <circle cx="32" cy="32" r="21.5" fill="none" stroke="#1c1405" stroke-opacity=".22" stroke-width="1.5" stroke-dasharray="2.2 2.6"/>
+      <text x="32" y="43.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="700" font-size="32" fill="#1c1405">§</text>
+      <path d="M14 20a22 22 0 0 1 14-9" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="2.5" stroke-linecap="round"/>
+    </symbol>
+  </svg>
 
-  <div id="boot" class="boot" role="status"><span class="spinner" aria-hidden="true">🎰</span> Shuffling the deck…</div>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <noscript><p style="padding:24px">Sonnetous needs JavaScript. Sorry, gamblers.</p></noscript>
 
-  <section id="fatal" class="fatal" hidden role="alert">
-    <div class="auth-card">
-      <div class="auth-logo">💥</div>
+  <div id="boot" class="boot" role="status" aria-live="polite">
+    <svg class="boot-mark" aria-hidden="true"><use href="#logo"/></svg>
+    <span>Shuffling the deck…</span>
+  </div>
+
+  <!-- ============================================================ FATAL -->
+  <section id="fatal" class="screen" hidden role="alert">
+    <div class="screen-card">
+      <div class="screen-ico" aria-hidden="true">💥</div>
       <h1>The house is on fire</h1>
-      <p>Sonnetous couldn't start. Here's what went wrong:</p>
+      <p class="lede">Sonnetous couldn't start. Here's what went wrong:</p>
       <pre id="fatal-msg"></pre>
-      <button type="button" class="btn primary" onclick="location.reload()">Reload</button>
+      <div class="screen-actions"><button type="button" class="btn btn-primary" id="btn-reload">Reload</button></div>
     </div>
   </section>
 
+  <!-- ============================================================ GATE (maintenance / banned) — rendered by js/ui/gate.js -->
+  <section id="gate" class="screen" hidden></section>
+
   <!-- ============================================================ AUTH -->
-  <section id="auth" class="auth" hidden>
-    <div class="auth-card">
-      <div class="auth-logo" aria-hidden="true">🎰</div>
-      <h1>Sonnetous</h1>
-      <p class="tagline">Bet on anything. Lose everything. Try again tomorrow.</p>
-      <div id="auth-local" class="banner banner-local" hidden>
-        Local mode — data lives in this browser only. Add a Firebase config to play with friends online.
+  <section id="auth" class="screen" hidden>
+    <div class="auth-wrap">
+      <div class="auth-hero" aria-hidden="true">
+        <div class="brand-lockup"><svg class="logo"><use href="#logo"/></svg><span class="wordmark">Sonnetous</span></div>
+        <h1>Bet on anything.<br><em>Lose everything.</em><br>Try again tomorrow.</h1>
+        <p class="tagline">A play-money prediction market for you and your friends. Fresh house markets every day, disputes settled by jury, bailouts for the broke.</p>
+        <div class="hero-cards" id="hero-cards"></div>
+        <div class="hero-points"><span>🎁 §500 to start</span><span>⚖️ Bonded reports</span><span>🤖 Auto-checked markets</span></div>
       </div>
-      <div class="seg" role="group" aria-label="Log in or sign up">
-        <button type="button" data-auth-mode="signin" class="active" aria-pressed="true">Log in</button>
-        <button type="button" data-auth-mode="signup" aria-pressed="false">Sign up</button>
+      <div class="screen-card auth-card">
+        <div class="brand-lockup mobile-only"><svg class="logo" aria-hidden="true"><use href="#logo"/></svg><span class="wordmark">Sonnetous</span></div>
+        <p class="tagline mobile-only">Bet on anything. Lose everything. Try again tomorrow.</p>
+        <div class="seg" role="group" aria-label="Log in or sign up">
+          <button type="button" data-auth-mode="signin" aria-pressed="true">Log in</button>
+          <button type="button" data-auth-mode="signup" aria-pressed="false">Sign up</button>
+        </div>
+        <form id="auth-form" novalidate>
+          <div class="field">
+            <label for="auth-username">Username</label>
+            <input id="auth-username" class="input" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required>
+          </div>
+          <div class="field">
+            <label for="auth-password">Password</label>
+            <input id="auth-password" class="input" name="password" type="password" autocomplete="current-password" required>
+          </div>
+          <p id="auth-hint" class="field-hint" hidden>3–20 characters: letters, numbers, underscore. Password 6+ characters. New players start with <b class="gold">§500</b>.</p>
+          <p id="auth-error" class="form-error" role="alert" hidden></p>
+          <button type="submit" class="btn btn-primary btn-lg btn-block" id="auth-submit">Log in</button>
+        </form>
+        <div id="auth-local" class="notice notice-info" style="margin-top:16px" hidden>
+          <span class="n-ico" aria-hidden="true">💾</span>
+          <span><b>Local mode.</b> Data lives in this browser only. Add a Firebase config to play with friends online.</span>
+        </div>
+        <div class="auth-foot">
+          <span>Play money only. Real grudges.</span>
+          <button type="button" class="linklike" data-open-how>How does this work?</button>
+        </div>
       </div>
-      <form id="auth-form" novalidate>
-        <label class="field">Username
-          <input name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required>
-        </label>
-        <label class="field">Password
-          <input name="password" type="password" autocomplete="current-password" required>
-        </label>
-        <p id="auth-error" class="form-error" role="alert" hidden></p>
-        <button type="submit" class="btn primary big" id="auth-submit">Log in</button>
-      </form>
-      <p class="hint" id="auth-hint">Username 3–20 characters: letters, numbers, underscore. New accounts start with §500.</p>
-      <button type="button" class="linklike" data-open-how>How does this work?</button>
     </div>
   </section>
 
   <!-- ============================================================ APP -->
   <div id="app" hidden>
     <header class="hdr">
-      <div class="hdr-top">
-        <span class="brand"><span aria-hidden="true">🎰</span> Sonnetous</span>
-        <span id="local-pill" class="pill pill-local" hidden title="Local mode — data lives in this browser only">LOCAL</span>
-        <span class="spacer"></span>
-        <button type="button" class="icon-btn" data-open-how aria-label="How it works" title="How it works">?</button>
-        <button type="button" id="btn-logout" class="btn ghost small">Log out</button>
+      <div class="hdr-inner">
+        <a class="brand" href="#" id="brand-home" aria-label="Sonnetous — markets">
+          <svg class="logo" aria-hidden="true"><use href="#logo"/></svg><span class="wordmark">Sonnetous</span>
+        </a>
+        <nav class="topnav" aria-label="Main">
+          <button type="button" data-tab="markets"><span class="t-ico" aria-hidden="true">📈</span>Markets</button>
+          <button type="button" data-tab="create"><span class="t-ico" aria-hidden="true">✨</span>Create</button>
+          <button type="button" data-tab="mybets"><span class="t-ico" aria-hidden="true">🎟️</span>My bets</button>
+          <button type="button" data-tab="leaderboard"><span class="t-ico" aria-hidden="true">🏆</span>Leaderboard</button>
+          <button type="button" data-tab="activity"><span class="t-ico" aria-hidden="true">📣</span>Activity</button>
+          <button type="button" data-tab="admin" id="nav-admin" hidden><span class="t-ico" aria-hidden="true">🛡️</span>Admin</button>
+        </nav>
+        <div class="hdr-right">
+          <div class="hdr-pills">
+            <span id="pill-local" class="pill pill-local" hidden title="Local mode — data lives in this browser only">Local</span>
+          </div>
+          <span id="h-skulls" class="hdr-chip" hidden></span>
+          <span id="h-penalty" class="hdr-chip tax" hidden></span>
+          <div class="hdr-networth" title="Net worth = balance + money in open bets"><span class="lbl">Net worth</span><span class="val" id="h-networth">§0</span></div>
+          <button type="button" class="wallet" id="h-wallet" aria-label="Balance — open profile">
+            <span class="coin" aria-hidden="true">§</span><span id="h-balance" class="num">§0</span>
+          </button>
+          <button type="button" class="profile-btn" id="btn-profile" aria-haspopup="dialog" aria-label="Profile and settings">
+            <span class="avatar" id="h-avatar" aria-hidden="true">?</span><span class="p-name" id="h-user"></span>
+          </button>
+        </div>
       </div>
-      <div class="hdr-stats">
-        <div class="stat stat-user"><span class="stat-label">Player</span><span id="h-user" class="stat-value username"></span></div>
-        <div class="stat"><span class="stat-label">Balance</span><span id="h-balance" class="stat-value gold">§0</span></div>
-        <div class="stat"><span class="stat-label">Net worth</span><span id="h-networth" class="stat-value">§0</span></div>
-        <div class="stat" id="h-skulls-wrap" hidden><span class="stat-label">Bankruptcies</span><span id="h-skulls" class="stat-value">💀×0</span></div>
-        <span id="h-penalty" class="badge badge-penalty" hidden></span>
+      <div id="pill-maint" class="maint-strip" role="status" hidden>
+        <span class="pill pill-maint">Maintenance on</span>
+        <span>Only you can see the game right now.</span>
+        <button type="button" class="linklike" data-tab="admin">Open the casino →</button>
       </div>
     </header>
 
     <div id="banner" class="banner-slot"></div>
 
-    <nav class="tabs" role="tablist" aria-label="Sections">
-      <button type="button" role="tab" data-tab="markets"><span class="ti" aria-hidden="true">🎲</span><span class="tl">Markets</span></button>
-      <button type="button" role="tab" data-tab="create"><span class="ti" aria-hidden="true">➕</span><span class="tl">Create</span></button>
-      <button type="button" role="tab" data-tab="mybets"><span class="ti" aria-hidden="true">🎟️</span><span class="tl">My Bets</span></button>
-      <button type="button" role="tab" data-tab="leaderboard"><span class="ti" aria-hidden="true">🏆</span><span class="tl">Leaders</span></button>
-      <button type="button" role="tab" data-tab="activity"><span class="ti" aria-hidden="true">📣</span><span class="tl">Activity</span></button>
-    </nav>
-
-    <main id="main">
-      <section id="panel-markets" role="tabpanel" data-panel="markets"></section>
-      <section id="panel-create" role="tabpanel" data-panel="create" hidden></section>
-      <section id="panel-mybets" role="tabpanel" data-panel="mybets" hidden></section>
-      <section id="panel-leaderboard" role="tabpanel" data-panel="leaderboard" hidden></section>
-      <section id="panel-activity" role="tabpanel" data-panel="activity" hidden></section>
+    <main id="main" class="main" tabindex="-1">
+      <section id="panel-markets" data-panel="markets" aria-label="Markets"></section>
+      <section id="panel-create" data-panel="create" aria-label="Create market" hidden></section>
+      <section id="panel-mybets" data-panel="mybets" aria-label="My bets" hidden></section>
+      <section id="panel-leaderboard" data-panel="leaderboard" aria-label="Leaderboard" hidden></section>
+      <section id="panel-activity" data-panel="activity" aria-label="Activity" hidden></section>
+      <section id="panel-admin" data-panel="admin" aria-label="Admin" hidden></section>
     </main>
 
     <footer class="foot">Sonnetous is play money for friends. No real gambling, no real stakes, only real grudges.</footer>
+
+    <nav class="tabbar" aria-label="Main">
+      <button type="button" data-tab="markets"><span class="t-ico" aria-hidden="true">📈</span>Markets</button>
+      <button type="button" data-tab="create"><span class="t-ico" aria-hidden="true">✨</span>Create</button>
+      <button type="button" data-tab="mybets"><span class="t-ico" aria-hidden="true">🎟️</span>My bets</button>
+      <button type="button" data-tab="leaderboard"><span class="t-ico" aria-hidden="true">🏆</span>Leaders</button>
+      <button type="button" data-tab="activity"><span class="t-ico" aria-hidden="true">📣</span>Activity</button>
+    </nav>
   </div>
 
-  <!-- ============================================================ HOW IT WORKS -->
-  <dialog id="how" aria-labelledby="how-title">
-    <div class="how-body">
-      <button type="button" class="icon-btn how-close" data-close-how aria-label="Close">✕</button>
-      <h2 id="how-title">How it works</h2>
-      <ul class="how-list">
-        <li><b>Start with §500 sonnetous.</b> Bet it on anything. Whole numbers only, minimum bet §1.</li>
-        <li><b>Going broke:</b> if you have under §1 and no open bets, you're broke. From the next calendar day you can claim a <b>§100 bailout</b>, but it costs you: a <b>25% winnings tax for 3 days</b> (a quarter of the profit on every winning bet is confiscated) and a <b>💀</b> on the leaderboard.</li>
-        <li><b>Fixed odds:</b> the odds (like ×3.00) are locked when you bet. Payout = stake × odds, rounded down, and it includes your stake.</li>
-        <li><b>Pool:</b> everyone's stakes go into one pot; winners split the whole pot pro-rata. Odds shown are live (total pool ÷ that option's pool) and change as bets arrive. If nobody backed the winner, everyone is refunded.</li>
-        <li><b>⏱ Timer markets</b> ask “How long till…?”. Pick a bucket: within 1 day (×6), 1–4 days (×3), 4–8 days (×1.8) or 8+ days (×1.3). When it happens, anyone can report it (house markets) with the time it happened; the matching bucket wins. No report after 8 days? It settles as 8+.</li>
-        <li><b>☑ Choice markets</b> have 2–6 options. House ones have fixed odds; ones made by players are pools and only the creator can settle or void them.</li>
-        <li><b>Daily house markets:</b> 4 fresh markets appear every day (UTC), the same for everyone. Betting closes when the timer runs out; then it's “awaiting result”.</li>
-        <li><b>Net worth</b> = balance + stakes in open bets. The leaderboard ranks by it.</li>
-      </ul>
-      <button type="button" class="btn primary" data-close-how>Got it</button>
+  <!-- ============================================================ MARKET SHEET -->
+  <dialog id="sheet" class="sheet" aria-labelledby="sheet-title">
+    <div class="sheet-panel">
+      <div class="sheet-grab" aria-hidden="true"></div>
+      <header class="sheet-head" id="sheet-head"></header>
+      <div class="sheet-body" id="sheet-body"></div>
     </div>
   </dialog>
 
-  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <!-- ============================================================ GENERIC MODAL (confirm / prompt) -->
+  <dialog id="modal" class="modal" aria-labelledby="modal-title"></dialog>
+
+  <!-- ============================================================ PROFILE -->
+  <dialog id="profile" class="modal profile-menu" aria-labelledby="profile-title"></dialog>
+
+  <!-- ============================================================ HOW IT WORKS -->
+  <dialog id="how" class="modal modal-wide" aria-labelledby="how-title"></dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
 </body>
 </html>

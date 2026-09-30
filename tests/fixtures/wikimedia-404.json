@@ -1,0 +1,7 @@
+{
+ "type": "https://mediawiki.org/wiki/HyperSwitch/errors/not_found",
+ "title": "Not found.",
+ "method": "get",
+ "detail": "The date(s) you used are valid, but we either do not have data for those date(s), or the project you asked for is not loaded yet.",
+ "uri": "/en.wikipedia/all-access/user/Taylor_Swift/daily/2026100100/2026100100"
+}
