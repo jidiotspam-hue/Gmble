@@ -16,6 +16,13 @@ const BASE = process.env.BASE_URL || 'http://localhost:8123';
 const SHOTS = process.env.SHOTS_DIR || path.join(os.tmpdir(), 'sonnetous-e2e');
 fs.mkdirSync(SHOTS, { recursive: true });
 
+// Always run in local mode, even when js/config.js has a real Firebase config,
+// so the smoke test never writes to the live database.
+async function forceLocalMode(context) {
+  await context.route('**/js/config.js', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: 'export const FIREBASE_CONFIG = null;\n' }));
+}
+
 async function loadPlaywright() {
   const candidates = [
     process.env.PLAYWRIGHT_MODULE,
@@ -181,6 +188,7 @@ let current = null;
 try {
   // ============================================================ mobile run
   const ctx = await browser.newContext({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: false });
+  await forceLocalMode(ctx);
   await ctx.addInitScript(INIT);
   const page = await newPage(ctx, 'main');
   current = page;
@@ -519,6 +527,7 @@ try {
   // ============================================================ desktop run
   log('desktop viewport sanity');
   const dctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await forceLocalMode(dctx);
   await dctx.addInitScript(INIT);
   const dp = await newPage(dctx, 'desktop');
   current = dp;
