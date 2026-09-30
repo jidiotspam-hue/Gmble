@@ -372,6 +372,7 @@ function attachCardHandlers(el, ctx) {
 
     try {
       if (action === 'bet') {
+        if (btn.dataset.busy === '1') return; // double-submit guard
         const amount = parseAmount(d.amount);
         btn.dataset.busy = '1';
         btn.disabled = true;

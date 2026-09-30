@@ -100,7 +100,7 @@ export function createCreateView(panel, ctx) {
       const closesAt = fromLocalInput(closesInput.value);
       if (!Number.isFinite(closesAt)) throw new Error('Pick when betting closes.');
       const market = E.buildCustomMarket({
-        id: crypto.randomUUID(),
+        id: (crypto.randomUUID ? crypto.randomUUID() : `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`),
         user: ctx.state.user,
         now: Date.now(),
         title: form.elements.title.value.trim(),
