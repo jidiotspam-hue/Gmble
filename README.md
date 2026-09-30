@@ -51,6 +51,7 @@ No build step and no dependencies.
 ```sh
 python3 -m http.server 8000   # then open http://localhost:8000
 node --test                   # run the unit tests (Node 20+)
+node tests/e2e/smoke.mjs      # browser smoke test (needs the server above on :8123 and the `playwright` npm package; BASE_URL/SHOTS_DIR optional)
 ```
 - `js/economy.js`: all game rules (pure functions)
 - `js/templates.js`: the auto-generated house markets. Add your own templates here!

@@ -400,6 +400,11 @@ dialog#how::backdrop { background: rgba(0, 0, 0, .7); }
   .brand { font-size: 1rem; }
   details.bettors li { grid-template-columns: minmax(0, 1fr) auto auto; }
   details.bettors .what { display: none; }
+  .board .name { max-width: 26vw; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+  .board .you { display: block; width: fit-content; }
+  .board .flags { white-space: normal; }
+  .board .flags .badge { font-size: .65rem; padding: .1rem .35rem; }
+  .board th, .board td { padding-left: .2rem; padding-right: .2rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {

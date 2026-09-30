@@ -1,16 +1,24 @@
 rules_version = '2';
 
-// Sonnetous — FRIENDS-ONLY trust model.
+// Sonnetous - FRIENDS-ONLY trust model.
 //
 // This is a game with fake currency played among people who trust each other, and the client
 // performs settlement (resolving a market credits/debits OTHER players' balances). Because of
-// that, any signed-in user must be able to update any user doc, market and bet. A malicious
-// signed-in user could therefore edit balances directly. That trade-off is accepted here; do
-// not reuse these rules for anything with real value. Mitigations kept below:
-//   * you must be signed in for everything;
-//   * you can only create your own user profile / claim usernames as yourself;
-//   * identity fields (uid, username, createdAt) can't be changed after creation;
-//   * bets can only be created as yourself; nothing can ever be deleted.
+// that, any signed-in user must be able to update other users' balance/totalWon, markets and
+// bets. A malicious signed-in user could therefore edit balances directly. That trade-off is
+// accepted here; do not reuse these rules for anything with real value.
+//
+// What the rules DO enforce (mostly to catch bugs and casual tampering):
+//   * you must be signed in for everything; nothing can ever be deleted;
+//   * a profile can only be created by its owner, with the starting balance, and only for a
+//     username that is claimed (in the same transaction) by that same uid;
+//   * usernames/{lowercase} docs are immutable, so a name can never be taken over;
+//   * on someone else's profile only `balance` and `totalWon` can change (settlement);
+//   * identity fields (uid, username, createdAt) never change; balances stay whole and >= 0;
+//   * bets can only be created as yourself, open and unpaid; afterwards only an OPEN bet can
+//     be settled, and only status/payout/taxed change (a bet can't be settled twice);
+//   * markets are created open and empty; only pool totals / result fields can change, only
+//     while open; only the creator can settle a custom market.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -18,16 +26,44 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
     match /users/{uid} {
       allow read: if signedIn();
+
       allow create: if signedIn()
                     && request.auth.uid == uid
-                    && request.resource.data.uid == uid;
-      // Any authed user may update (settlement touches other users' balances).
+                    && request.resource.data.keys().hasOnly(
+                         ['uid', 'username', 'balance', 'createdAt', 'bankruptcies',
+                          'brokeSince', 'penaltyUntil', 'totalWagered', 'totalWon'])
+                    && request.resource.data.keys().hasAll(
+                         ['uid', 'username', 'balance', 'createdAt', 'bankruptcies',
+                          'brokeSince', 'penaltyUntil', 'totalWagered', 'totalWon'])
+                    && request.resource.data.uid == uid
+                    && request.resource.data.username is string
+                    && request.resource.data.username.matches('[a-zA-Z0-9_]{3,20}')
+                    && request.resource.data.balance == 500
+                    && request.resource.data.bankruptcies == 0
+                    && request.resource.data.brokeSince == null
+                    && request.resource.data.penaltyUntil == null
+                    && request.resource.data.totalWagered == 0
+                    && request.resource.data.totalWon == 0
+                    && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username.lower())).data.uid == uid;
+
+      // Anyone may update (settlement touches other users' balances) but see the field limits.
       allow update: if signedIn()
                     && request.resource.data.uid == resource.data.uid
                     && request.resource.data.username == resource.data.username
-                    && request.resource.data.createdAt == resource.data.createdAt;
+                    && request.resource.data.createdAt == resource.data.createdAt
+                    && request.resource.data.balance is int
+                    && request.resource.data.balance >= 0
+                    && (request.auth.uid == uid
+                        ? changed().hasOnly(['balance', 'totalWon', 'totalWagered', 'bankruptcies',
+                                             'brokeSince', 'penaltyUntil'])
+                        : changed().hasOnly(['balance', 'totalWon']));
+
       allow delete: if false;
     }
 
@@ -35,22 +71,55 @@ service cloud.firestore {
     match /usernames/{name} {
       allow read: if signedIn();
       allow create: if signedIn()
+                    && name.matches('[a-z0-9_]{3,20}')
                     && !exists(/databases/$(database)/documents/usernames/$(name))
+                    && request.resource.data.keys().hasOnly(['uid'])
                     && request.resource.data.uid == request.auth.uid;
       allow update, delete: if false;
     }
 
     match /markets/{marketId} {
       allow read: if signedIn();
-      allow create, update: if signedIn();
+
+      allow create: if signedIn()
+                    && request.resource.data.id == marketId
+                    && request.resource.data.status == 'open'
+                    && request.resource.data.totalPool == 0
+                    && request.resource.data.betCount == 0
+                    && ((request.resource.data.type == 'custom'
+                         && request.resource.data.createdBy == request.auth.uid)
+                        || (request.resource.data.type == 'auto'
+                            && request.resource.data.createdBy == 'house'));
+
+      // Bets bump the totals; settling sets the result. Only while open; nothing else may change.
+      allow update: if signedIn()
+                    && resource.data.status == 'open'
+                    && changed().hasOnly(['optionTotals', 'totalPool', 'betCount', 'status',
+                                          'resolvedOptionId', 'resolvedAt', 'resolvedBy', 'eventAt'])
+                    && (!changed().hasAny(['status'])
+                        || resource.data.type == 'auto'
+                        || resource.data.createdBy == request.auth.uid);
+
       allow delete: if false;
     }
 
     match /bets/{betId} {
       allow read: if signedIn();
-      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
-      // Settlement (by any user) updates status/payout on other people's bets.
-      allow update: if signedIn();
+
+      allow create: if signedIn()
+                    && request.resource.data.id == betId
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.status == 'open'
+                    && request.resource.data.amount is int
+                    && request.resource.data.amount >= 1
+                    && request.resource.data.payout == 0;
+
+      // Settlement (by any user) updates status/payout on other people's bets, once.
+      allow update: if signedIn()
+                    && resource.data.status == 'open'
+                    && request.resource.data.status in ['won', 'lost', 'void']
+                    && changed().hasOnly(['status', 'payout', 'taxed']);
+
       allow delete: if false;
     }
   }

@@ -185,6 +185,8 @@ function onUser(user) {
     setAuthMode('signin');
     return;
   }
+  // the session can be swapped from another tab (shared localStorage): drop the previous user's state
+  if (state.user && state.user.uid !== user.uid) endSession();
   state.user = user;
   $('auth').hidden = true;
   $('app').hidden = false;
