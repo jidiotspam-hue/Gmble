@@ -1,0 +1,57 @@
+rules_version = '2';
+
+// Sonnetous — FRIENDS-ONLY trust model.
+//
+// This is a game with fake currency played among people who trust each other, and the client
+// performs settlement (resolving a market credits/debits OTHER players' balances). Because of
+// that, any signed-in user must be able to update any user doc, market and bet. A malicious
+// signed-in user could therefore edit balances directly. That trade-off is accepted here; do
+// not reuse these rules for anything with real value. Mitigations kept below:
+//   * you must be signed in for everything;
+//   * you can only create your own user profile / claim usernames as yourself;
+//   * identity fields (uid, username, createdAt) can't be changed after creation;
+//   * bets can only be created as yourself; nothing can ever be deleted.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+                    && request.auth.uid == uid
+                    && request.resource.data.uid == uid;
+      // Any authed user may update (settlement touches other users' balances).
+      allow update: if signedIn()
+                    && request.resource.data.uid == resource.data.uid
+                    && request.resource.data.username == resource.data.username
+                    && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    // usernames/{lowercaseName} -> { uid }. Claimed once, never changed.
+    match /usernames/{name} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+                    && !exists(/databases/$(database)/documents/usernames/$(name))
+                    && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /markets/{marketId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn();
+      allow delete: if false;
+    }
+
+    match /bets/{betId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      // Settlement (by any user) updates status/payout on other people's bets.
+      allow update: if signedIn();
+      allow delete: if false;
+    }
+  }
+}

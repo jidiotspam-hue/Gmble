@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0f0d">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Sonnetous — bet a fake currency on anything with your friends. Bet on anything. Lose everything. Try again tomorrow.">
+  <title>Sonnetous</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%B0%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/styles.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <noscript><p class="fatal-static">Sonnetous needs JavaScript. Sorry, gamblers.</p></noscript>
+
+  <div id="boot" class="boot" role="status"><span class="spinner" aria-hidden="true">🎰</span> Shuffling the deck…</div>
+
+  <section id="fatal" class="fatal" hidden role="alert">
+    <div class="auth-card">
+      <div class="auth-logo">💥</div>
+      <h1>The house is on fire</h1>
+      <p>Sonnetous couldn't start. Here's what went wrong:</p>
+      <pre id="fatal-msg"></pre>
+      <button type="button" class="btn primary" onclick="location.reload()">Reload</button>
+    </div>
+  </section>
+
+  <!-- ============================================================ AUTH -->
+  <section id="auth" class="auth" hidden>
+    <div class="auth-card">
+      <div class="auth-logo" aria-hidden="true">🎰</div>
+      <h1>Sonnetous</h1>
+      <p class="tagline">Bet on anything. Lose everything. Try again tomorrow.</p>
+      <div id="auth-local" class="banner banner-local" hidden>
+        Local mode — data lives in this browser only. Add a Firebase config to play with friends online.
+      </div>
+      <div class="seg" role="group" aria-label="Log in or sign up">
+        <button type="button" data-auth-mode="signin" class="active" aria-pressed="true">Log in</button>
+        <button type="button" data-auth-mode="signup" aria-pressed="false">Sign up</button>
+      </div>
+      <form id="auth-form" novalidate>
+        <label class="field">Username
+          <input name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required>
+        </label>
+        <label class="field">Password
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <p id="auth-error" class="form-error" role="alert" hidden></p>
+        <button type="submit" class="btn primary big" id="auth-submit">Log in</button>
+      </form>
+      <p class="hint" id="auth-hint">Username 3–20 characters: letters, numbers, underscore. New accounts start with §500.</p>
+      <button type="button" class="linklike" data-open-how>How does this work?</button>
+    </div>
+  </section>
+
+  <!-- ============================================================ APP -->
+  <div id="app" hidden>
+    <header class="hdr">
+      <div class="hdr-top">
+        <span class="brand"><span aria-hidden="true">🎰</span> Sonnetous</span>
+        <span id="local-pill" class="pill pill-local" hidden title="Local mode — data lives in this browser only">LOCAL</span>
+        <span class="spacer"></span>
+        <button type="button" class="icon-btn" data-open-how aria-label="How it works" title="How it works">?</button>
+        <button type="button" id="btn-logout" class="btn ghost small">Log out</button>
+      </div>
+      <div class="hdr-stats">
+        <div class="stat stat-user"><span class="stat-label">Player</span><span id="h-user" class="stat-value username"></span></div>
+        <div class="stat"><span class="stat-label">Balance</span><span id="h-balance" class="stat-value gold">§0</span></div>
+        <div class="stat"><span class="stat-label">Net worth</span><span id="h-networth" class="stat-value">§0</span></div>
+        <div class="stat" id="h-skulls-wrap" hidden><span class="stat-label">Bankruptcies</span><span id="h-skulls" class="stat-value">💀×0</span></div>
+        <span id="h-penalty" class="badge badge-penalty" hidden></span>
+      </div>
+    </header>
+
+    <div id="banner" class="banner-slot"></div>
+
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button type="button" role="tab" data-tab="markets"><span class="ti" aria-hidden="true">🎲</span><span class="tl">Markets</span></button>
+      <button type="button" role="tab" data-tab="create"><span class="ti" aria-hidden="true">➕</span><span class="tl">Create</span></button>
+      <button type="button" role="tab" data-tab="mybets"><span class="ti" aria-hidden="true">🎟️</span><span class="tl">My Bets</span></button>
+      <button type="button" role="tab" data-tab="leaderboard"><span class="ti" aria-hidden="true">🏆</span><span class="tl">Leaders</span></button>
+      <button type="button" role="tab" data-tab="activity"><span class="ti" aria-hidden="true">📣</span><span class="tl">Activity</span></button>
+    </nav>
+
+    <main id="main">
+      <section id="panel-markets" role="tabpanel" data-panel="markets"></section>
+      <section id="panel-create" role="tabpanel" data-panel="create" hidden></section>
+      <section id="panel-mybets" role="tabpanel" data-panel="mybets" hidden></section>
+      <section id="panel-leaderboard" role="tabpanel" data-panel="leaderboard" hidden></section>
+      <section id="panel-activity" role="tabpanel" data-panel="activity" hidden></section>
+    </main>
+
+    <footer class="foot">Sonnetous is play money for friends. No real gambling, no real stakes, only real grudges.</footer>
+  </div>
+
+  <!-- ============================================================ HOW IT WORKS -->
+  <dialog id="how" aria-labelledby="how-title">
+    <div class="how-body">
+      <button type="button" class="icon-btn how-close" data-close-how aria-label="Close">✕</button>
+      <h2 id="how-title">How it works</h2>
+      <ul class="how-list">
+        <li><b>Start with §500 sonnetous.</b> Bet it on anything. Whole numbers only, minimum bet §1.</li>
+        <li><b>Going broke:</b> if you have under §1 and no open bets, you're broke. From the next calendar day you can claim a <b>§100 bailout</b>, but it costs you: a <b>25% winnings tax for 3 days</b> (a quarter of the profit on every winning bet is confiscated) and a <b>💀</b> on the leaderboard.</li>
+        <li><b>Fixed odds:</b> the odds (like ×3.00) are locked when you bet. Payout = stake × odds, rounded down, and it includes your stake.</li>
+        <li><b>Pool:</b> everyone's stakes go into one pot; winners split the whole pot pro-rata. Odds shown are live (total pool ÷ that option's pool) and change as bets arrive. If nobody backed the winner, everyone is refunded.</li>
+        <li><b>⏱ Timer markets</b> ask “How long till…?”. Pick a bucket: within 1 day (×6), 1–4 days (×3), 4–8 days (×1.8) or 8+ days (×1.3). When it happens, anyone can report it (house markets) with the time it happened; the matching bucket wins. No report after 8 days? It settles as 8+.</li>
+        <li><b>☑ Choice markets</b> have 2–6 options. House ones have fixed odds; ones made by players are pools and only the creator can settle or void them.</li>
+        <li><b>Daily house markets:</b> 4 fresh markets appear every day (UTC), the same for everyone. Betting closes when the timer runs out; then it's “awaiting result”.</li>
+        <li><b>Net worth</b> = balance + stakes in open bets. The leaderboard ranks by it.</li>
+      </ul>
+      <button type="button" class="btn primary" data-close-how>Got it</button>
+    </div>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>
