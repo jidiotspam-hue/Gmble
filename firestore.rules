@@ -1,126 +1,714 @@
 rules_version = '2';
 
-// Sonnetous - FRIENDS-ONLY trust model.
+// Sonnetous v2 security rules (see SPEC-v2.md). The browser is NOT trusted: every balance change, every
+// market transition and every admin action is validated here, server side, on the Spark plan.
 //
-// This is a game with fake currency played among people who trust each other, and the client
-// performs settlement (resolving a market credits/debits OTHER players' balances). Because of
-// that, any signed-in user must be able to update other users' balance/totalWon, markets and
-// bets. A malicious signed-in user could therefore edit balances directly. That trade-off is
-// accepted here; do not reuse these rules for anything with real value.
+//  * A player can only ever write their OWN players/{uid} doc. Nobody writes another player's balance.
+//  * Settlement is claim-based: once a market is final each player claims their own bets / bonds.
+//  * Every operation is ONE atomic batch/transaction. The docs in the batch cross-check each other with
+//    getAfter(): a "primary" doc carries the business checks (time windows, status, ownership) and the
+//    "companion" docs carry the arithmetic, and each side refuses to change unless the other side is in
+//    the same batch with matching numbers. See the operation table at the bottom of this file.
+//  * Only the admin can create the daily house ("auto") markets.
+//  * Nothing can be deleted, except: admin unbans (bans/{uid}) and the admin's one-time claim cleanup.
+//  * app/config gates the whole game (missing config = closed, maintenance = closed for non-admins),
+//    bans/{uid} blocks a player completely (reads and writes).
 //
-// What the rules DO enforce (mostly to catch bugs and casual tampering):
-//   * you must be signed in for everything; nothing can ever be deleted;
-//   * a profile can only be created by its owner, with the starting balance, and only for a
-//     username that is claimed (in the same transaction) by that same uid;
-//   * usernames/{lowercase} docs are immutable, so a name can never be taken over;
-//   * on someone else's profile only `balance` and `totalWon` can change (settlement);
-//   * identity fields (uid, username, createdAt) never change; balances stay whole and >= 0;
-//   * bets can only be created as yourself, open and unpaid; afterwards only an OPEN bet can
-//     be settled, and only status/payout/taxed change (a bet can't be settled twice);
-//   * markets are created open and empty; only pool totals / result fields can change, only
-//     while open; only the creator can settle a custom market.
+// Limits (measured in the emulator, which enforces them like production): Firestore allows 10 document-access
+// calls per document write and 20 per batch/transaction (repeat calls on the same doc are cached; exists() and
+// get() count separately). Worst single doc rule here: 6 calls (bet / vote create); worst batch: 11 (placeBet).
+// The rules engine also stops after 1000 evaluated expressions per request; the heaviest valid batch (placeBet)
+// leaves roughly 300+ spare, which is why players/markets updates dispatch on the changed keys instead of
+// trying every kind, and why big maps are diffed once. Keep additions small.
+//
+// TEST-ONLY: tests/rules-helpers.mjs rewrites the four "tunable" functions marked below (admin hash and
+// the three long time windows) in a COPY of this file. Production values stay here.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function signedIn() {
-      return request.auth != null;
+    // ---------------------------------------------------------------- tunables
+    function ADMIN_CODE_SHA256() { return '327ed216b034673656912e0eb7aa10b4b953933a1fd04ff136589337b9072bb1'; }
+    function CHALLENGE_WINDOW_MS() { return 43200000; }  // 12h  (economy.CHALLENGE_WINDOW_MS)
+    function VOTE_WINDOW_MS() { return 86400000; }       // 24h  (economy.VOTE_WINDOW_MS)
+    function BAILOUT_DAY_MS() { return 86400000; }       // bankruptcy bailout unlocks at the next multiple of this (UTC midnight)
+
+    // ---------------------------------------------------------------- constants (economy.js)
+    function START_BALANCE() { return 500; }
+    function RESTART_BALANCE() { return 100; }
+    function BOND() { return 20; }
+    function COOLDOWN_MS() { return 2000; }
+    function SKEW_MS() { return 300000; }
+    function BACKDATE_MS() { return 30000; }
+    function DAY_MS() { return 86400000; }
+    function PENALTY_MS() { return 259200000; }          // 3 days
+    function MAX_MARKETS_PER_DAY() { return 5; }
+    function MIN_ODDS() { return 1.01; }
+    function MAX_ODDS() { return 20; }
+
+    // ---------------------------------------------------------------- paths
+    function CFG() { return /databases/$(database)/documents/app/config; }
+    function CLAIM() { return /databases/$(database)/documents/app/claim; }
+    function BAN(u) { return /databases/$(database)/documents/bans/$(u); }
+    function HANDLE(h) { return /databases/$(database)/documents/handles/$(h); }
+    function P(u) { return /databases/$(database)/documents/players/$(u); }
+    function M(id) { return /databases/$(database)/documents/markets2/$(id); }
+    function B(id) { return /databases/$(database)/documents/bets2/$(id); }
+    function S(id) { return /databases/$(database)/documents/stakes/$(id); }
+    function V(id) { return /databases/$(database)/documents/votes/$(id); }
+
+    // ---------------------------------------------------------------- helpers
+    function signedIn() { return request.auth != null; }
+    function nowMs() { return request.time.toMillis(); }
+    // a client timestamp we have to trust is only accepted within +-5 minutes of server time
+    function near(x) { return x is number && math.abs(x - nowMs()) <= SKEW_MS(); }
+    // bet timestamps decide timer outcomes (a bet placed after the event is void), so they cannot be backdated
+    // by more than 30s (forward dating only hurts the bettor)
+    function nearBet(x) { return x is number && x >= nowMs() - BACKDATE_MS() && x <= nowMs() + SKEW_MS(); }
+    // ids that come from document fields end up in paths: no slashes, bounded length
+    function validId(x) { return x is string && x.matches('[A-Za-z0-9_-]{1,120}'); }
+    function okStr(x, max) { return x is string && x.size() <= max; }
+    function isFinal(m) { return m.status == 'resolved' || m.status == 'void'; }
+
+    // ---------------------------------------------------------------- access gate
+    // get() fails (=> deny) when app/config does not exist: an unclaimed game is closed for everybody.
+    function isAdmin() { return signedIn() && get(CFG()).data.adminUid == request.auth.uid; }
+    function appOpen() {
+      let c = get(CFG()).data;
+      return c.maintenance == false || c.adminUid == request.auth.uid;
+    }
+    function notBanned() { return !exists(BAN(request.auth.uid)); }
+    function gate() { return signedIn() && appOpen() && notBanned(); }
+
+    // ---------------------------------------------------------------- payout math (mirror of economy.js)
+    // Timer bet on bucket B wins iff (market.eventAt - bet.placedAt) is in [B.fromMs, B.toMs); event before the bet => void;
+    // expiry resolution (eventAt null) => bets on the expiry option win. Choice bet wins iff its option is the result.
+    function bucketHit(b, m) {
+      return m.eventAt - b.placedAt >= m.bucketsById[b.optionId].fromMs
+        && (m.bucketsById[b.optionId].toMs == null || m.eventAt - b.placedAt < m.bucketsById[b.optionId].toMs);
+    }
+    function claimStatus(b, m) {
+      return m.status == 'void' ? 'void'
+        : ((m.kind == 'timer' && m.eventAt != null)
+          ? (m.eventAt < b.placedAt ? 'void' : (bucketHit(b, m) ? 'won' : 'lost'))
+          : (b.optionId == m.resolvedOptionId ? 'won' : 'lost'));
+    }
+    // fixed gross = floor(amount*odds + 1e-9); pool gross = floor(amount*totalPool/optionTotals[winner]); void refunds
+    function grossOf(b, m) {
+      return claimStatus(b, m) == 'void' ? b.amount
+        : (claimStatus(b, m) == 'lost' ? 0
+          : (m.mode == 'fixed' ? math.floor(b.amount * b.odds + 0.000000001)
+            : math.floor((b.amount * m.totalPool - (b.amount * m.totalPool) % m.optionTotals[m.resolvedOptionId])
+                / m.optionTotals[m.resolvedOptionId])));
+    }
+    // 25% tax on the profit of a won bet while the bankruptcy penalty is active (strictly in the future)
+    function taxOf(b, gross, penaltyUntil) {
+      return (penaltyUntil != null && penaltyUntil > nowMs() && gross > b.amount)
+        ? math.floor((gross - b.amount) * 0.25) : 0;
+    }
+    // bond payouts once a market is final (reporter / challenger)
+    function bondReporter(m) {
+      return m.reportedBy == null ? 0
+        : (m.challengedBy == null ? BOND()
+          : (m.votesUphold > m.votesOverturn ? 2 * BOND()
+            : (m.votesOverturn > m.votesUphold ? 0 : BOND())));
+    }
+    function bondChallenger(m) {
+      return m.challengedBy == null ? 0
+        : (m.votesUphold > m.votesOverturn ? 0
+          : (m.votesOverturn > m.votesUphold ? 2 * BOND() : BOND()));
     }
 
-    function changed() {
-      return request.resource.data.diff(resource.data).affectedKeys();
-    }
-
-    match /users/{uid} {
-      allow read: if signedIn();
-
+    // ================================================================ app/config, app/claim
+    match /app/config {
+      allow read: if true;
+      // Claiming the admin seat: allowed once (create only works while the doc does not exist), by anyone
+      // who knows the code. The code is NOT stored in config (which everyone can read): the same batch
+      // writes it to app/claim, which nobody can read, and the rule hashes it from there.
       allow create: if signedIn()
-                    && request.auth.uid == uid
-                    && request.resource.data.keys().hasOnly(
-                         ['uid', 'username', 'balance', 'createdAt', 'bankruptcies',
-                          'brokeSince', 'penaltyUntil', 'totalWagered', 'totalWon'])
-                    && request.resource.data.keys().hasAll(
-                         ['uid', 'username', 'balance', 'createdAt', 'bankruptcies',
-                          'brokeSince', 'penaltyUntil', 'totalWagered', 'totalWon'])
-                    && request.resource.data.uid == uid
-                    && request.resource.data.username is string
-                    && request.resource.data.username.matches('[a-zA-Z0-9_]{3,20}')
-                    && request.resource.data.balance == 500
-                    && request.resource.data.bankruptcies == 0
-                    && request.resource.data.brokeSince == null
-                    && request.resource.data.penaltyUntil == null
-                    && request.resource.data.totalWagered == 0
-                    && request.resource.data.totalWon == 0
-                    && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username.lower())).data.uid == uid;
-
-      // Anyone may update (settlement touches other users' balances) but see the field limits.
+        && request.resource.data.keys().hasOnly(['adminUid', 'maintenance', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['adminUid', 'maintenance', 'updatedAt'])
+        && request.resource.data.adminUid == request.auth.uid
+        && request.resource.data.maintenance == true
+        && request.resource.data.updatedAt is number
+        && hashing.sha256(getAfter(CLAIM()).data.code).toHexString().lower() == ADMIN_CODE_SHA256();
       allow update: if signedIn()
-                    && request.resource.data.uid == resource.data.uid
-                    && request.resource.data.username == resource.data.username
-                    && request.resource.data.createdAt == resource.data.createdAt
-                    && request.resource.data.balance is int
-                    && request.resource.data.balance >= 0
-                    && (request.auth.uid == uid
-                        ? changed().hasOnly(['balance', 'totalWon', 'totalWagered', 'bankruptcies',
-                                             'brokeSince', 'penaltyUntil'])
-                        : changed().hasOnly(['balance', 'totalWon']));
-
+        && resource.data.adminUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['maintenance', 'updatedAt'])
+        && request.resource.data.maintenance is bool
+        && near(request.resource.data.updatedAt);
       allow delete: if false;
     }
 
-    // usernames/{lowercaseName} -> { uid }. Claimed once, never changed.
-    match /usernames/{name} {
-      allow read: if signedIn();
-      allow create: if signedIn()
-                    && name.matches('[a-z0-9_]{3,20}')
-                    && !exists(/databases/$(database)/documents/usernames/$(name))
-                    && request.resource.data.keys().hasOnly(['uid'])
-                    && request.resource.data.uid == request.auth.uid;
+    match /app/claim {
+      allow read: if false;
+      allow create, update: if signedIn()
+        && !exists(CFG())
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code is string
+        && request.resource.data.code.size() <= 200;
+      // the admin wipes the plaintext code again right after claiming
+      allow delete: if isAdmin();
+    }
+
+    // ================================================================ bans
+    match /bans/{buid} {
+      allow get: if signedIn() && (request.auth.uid == buid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin()
+        && buid != get(CFG()).data.adminUid
+        && request.resource.data.keys().hasOnly(['uid', 'username', 'by', 'at', 'reason'])
+        && request.resource.data.keys().hasAll(['uid', 'username', 'by', 'at', 'reason'])
+        && request.resource.data.uid == buid
+        && request.resource.data.by == request.auth.uid
+        && okStr(request.resource.data.username, 40)
+        && okStr(request.resource.data.reason, 200)
+        && near(request.resource.data.at);
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    // ================================================================ handles (unique usernames)
+    match /handles/{hid} {
+      allow read: if gate();
+      // created together with the player doc (which carries the username)
+      allow create: if gate()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && !exists(P(request.auth.uid))
+        && getAfter(P(request.auth.uid)).data.username.lower() == hid;
       allow update, delete: if false;
     }
 
-    match /markets/{marketId} {
-      allow read: if signedIn();
+    // ================================================================ players
+    function playerCreateOk(pid) {
+      let d = request.resource.data;
+      return d.keys().hasAll(['uid', 'username', 'balance', 'openStake', 'createdAt', 'bankruptcies', 'brokeSince',
+          'penaltyUntil', 'totalWagered', 'totalWon', 'lastBetAt', 'marketsDay', 'marketsCount', 'lastClaimId',
+          'lastBondMarketId'])
+        && d.keys().hasOnly(['uid', 'username', 'balance', 'openStake', 'createdAt', 'bankruptcies', 'brokeSince',
+          'penaltyUntil', 'totalWagered', 'totalWon', 'lastBetAt', 'marketsDay', 'marketsCount', 'lastClaimId',
+          'lastBondMarketId', 'lastBetId'])
+        && d.uid == pid
+        && d.username is string && d.username.matches('[A-Za-z0-9_]{3,20}')
+        && d.balance == START_BALANCE() && d.openStake == 0 && near(d.createdAt) && d.bankruptcies == 0
+        && d.brokeSince == null && d.penaltyUntil == null && d.totalWagered == 0 && d.totalWon == 0
+        && d.lastBetAt == 0 && d.marketsDay == 0 && d.marketsCount == 0
+        && d.lastClaimId == null && d.lastBondMarketId == null
+        && (!('lastBetId' in d) || d.lastBetId == null)
+        && getAfter(HANDLE(d.username.lower())).data.uid == pid;
+    }
 
-      allow create: if signedIn()
-                    && request.resource.data.id == marketId
-                    && request.resource.data.status == 'open'
-                    && request.resource.data.totalPool == 0
-                    && request.resource.data.betCount == 0
-                    && ((request.resource.data.type == 'custom'
-                         && request.resource.data.createdBy == request.auth.uid)
-                        || (request.resource.data.type == 'auto'
-                            && request.resource.data.createdBy == 'house'));
+    // --- placeBet: balance -amount, openStake +amount, totalWagered +amount, lastBetAt = bet.placedAt (2s cooldown)
+    function kBet(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['balance', 'openStake', 'totalWagered', 'lastBetAt', 'lastBetId'])
+        && ch.hasAll(['balance', 'openStake', 'totalWagered', 'lastBetAt', 'lastBetId'])
+        && validId(n.lastBetId)
+        && nearBet(n.lastBetAt)
+        && n.lastBetAt >= p.lastBetAt + COOLDOWN_MS()
+        && nowMs() >= p.lastBetAt + COOLDOWN_MS()
+        && betMatches(pid, n, p, getAfter(B(n.lastBetId)).data);
+    }
+    // The bet doc must be NEW in this batch: its placedAt equals the (strictly increasing) lastBetAt, so no
+    // older bet can ever be replayed. Its create rule (betCreateOk) has already run.
+    function betMatches(pid, n, p, b) {
+      return b.uid == pid && b.placedAt == n.lastBetAt
+        && n.balance == p.balance - b.amount && n.balance >= 0
+        && n.openStake == p.openStake + b.amount
+        && n.totalWagered == p.totalWagered + b.amount;
+    }
 
-      // Bets bump the totals; settling sets the result. Only while open; nothing else may change.
-      allow update: if signedIn()
-                    && resource.data.status == 'open'
-                    && changed().hasOnly(['optionTotals', 'totalPool', 'betCount', 'status',
-                                          'resolvedOptionId', 'resolvedAt', 'resolvedBy', 'eventAt'])
-                    && (!changed().hasAny(['status'])
-                        || resource.data.type == 'auto'
-                        || resource.data.createdBy == request.auth.uid);
+    // --- claimBet: balance +payout, openStake -amount, totalWon +payout (won), lastClaimId = bet
+    function kClaim(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['balance', 'openStake', 'totalWon', 'lastClaimId'])
+        && ch.hasAll(['openStake', 'lastClaimId'])
+        && validId(n.lastClaimId)
+        && claimMatches(pid, n, p, get(B(n.lastClaimId)).data, getAfter(B(n.lastClaimId)).data);
+    }
+    function claimMatches(pid, n, p, b0, b1) {
+      return b0.uid == pid && b0.status == 'open' && b1.status != 'open'
+        && n.balance == p.balance + b1.payout
+        && n.openStake == p.openStake - b1.amount
+        && n.totalWon == p.totalWon + (b1.status == 'won' ? b1.payout : 0);
+    }
 
+    // --- report / challenge: pay the bond
+    function kBondPay(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['balance', 'lastBondMarketId'])
+        && ch.hasAll(['balance'])
+        && n.balance == p.balance - BOND() && n.balance >= 0
+        && validId(n.lastBondMarketId)
+        && bondPayMatches(pid, get(M(n.lastBondMarketId)).data, getAfter(M(n.lastBondMarketId)).data);
+    }
+    function bondPayMatches(pid, m0, m1) {
+      return (m0.status == 'open' && m1.status == 'reported' && m1.reportedBy == pid)
+        || (m0.status == 'reported' && m1.status == 'challenged' && m1.challengedBy == pid);
+    }
+
+    // --- claimBond: get the bond (and reward) back once the market is final
+    function kBondClaim(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['balance', 'lastBondMarketId'])
+        && validId(n.lastBondMarketId)
+        && bondClaimMatches(pid, n, p, get(M(n.lastBondMarketId)).data, getAfter(M(n.lastBondMarketId)).data);
+    }
+    function bondClaimMatches(pid, n, p, m0, m1) {
+      return isFinal(m0) && (
+        (m0.reportedBy == pid && m0.reporterBondPaid == false && m1.reporterBondPaid == true
+          && n.balance == p.balance + bondReporter(m0))
+        || (m0.challengedBy == pid && m0.challengerBondPaid == false && m1.challengerBondPaid == true
+          && n.balance == p.balance + bondChallenger(m0)));
+    }
+
+    // --- createMarket: at most 5 custom markets per UTC day (the market create rule requires this bump)
+    function kMarkets(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['marketsDay', 'marketsCount'])
+        && ch.hasAny(['marketsDay', 'marketsCount'])
+        && n.marketsDay is int && n.marketsCount is int
+        && n.marketsDay * DAY_MS() <= nowMs() + SKEW_MS()
+        && (n.marketsDay + 1) * DAY_MS() > nowMs() - SKEW_MS()
+        && ((n.marketsDay == p.marketsDay && n.marketsCount == p.marketsCount + 1 && n.marketsCount <= MAX_MARKETS_PER_DAY())
+          || (n.marketsDay > p.marketsDay && n.marketsCount == 1))
+        && gate();
+    }
+
+    // --- markBroke: flag the moment you ran out of money
+    function kBroke(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['brokeSince'])
+        && p.balance < 1 && p.openStake == 0 && p.brokeSince == null
+        && near(n.brokeSince)
+        && gate();
+    }
+
+    // --- claimRestart: after the next UTC midnight, balance 100, +1 bankruptcy, 3 day penalty
+    function kRestart(pid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['balance', 'bankruptcies', 'brokeSince', 'penaltyUntil'])
+        && p.balance < 1 && p.openStake == 0 && p.brokeSince != null
+        && nowMs() >= (math.floor(p.brokeSince / BAILOUT_DAY_MS()) + 1) * BAILOUT_DAY_MS()
+        && n.balance == RESTART_BALANCE()
+        && n.bankruptcies == p.bankruptcies + 1
+        && n.brokeSince == null
+        && n.penaltyUntil is number && math.abs(n.penaltyUntil - (nowMs() + PENALTY_MS())) <= SKEW_MS()
+        && gate();
+    }
+
+    // Dispatch on the fields that changed (cheaper than trying every kind; each kind is still strict about
+    // its own exact field set, so picking a branch gains an attacker nothing).
+    function playerUpdateOk(pid, ch) {
+      return ch.hasAny(['lastBetId']) ? kBet(pid, ch)
+        : (ch.hasAny(['lastClaimId']) ? kClaim(pid, ch)
+        : (ch.hasAny(['marketsDay', 'marketsCount']) ? kMarkets(pid, ch)
+        : (ch.hasAny(['bankruptcies', 'penaltyUntil']) ? kRestart(pid, ch)
+        : (ch.hasAny(['brokeSince']) ? kBroke(pid, ch)
+        : (kBondPay(pid, ch) || kBondClaim(pid, ch))))));
+    }
+
+    match /players/{pid} {
+      allow read: if gate();
+      allow create: if gate() && pid == request.auth.uid && playerCreateOk(pid);
+      allow update: if signedIn() && pid == request.auth.uid
+        && playerUpdateOk(pid, request.resource.data.diff(resource.data).affectedKeys());
       allow delete: if false;
     }
 
-    match /bets/{betId} {
-      allow read: if signedIn();
-
-      allow create: if signedIn()
-                    && request.resource.data.id == betId
-                    && request.resource.data.uid == request.auth.uid
-                    && request.resource.data.status == 'open'
-                    && request.resource.data.amount is int
-                    && request.resource.data.amount >= 1
-                    && request.resource.data.payout == 0;
-
-      // Settlement (by any user) updates status/payout on other people's bets, once.
-      allow update: if signedIn()
-                    && resource.data.status == 'open'
-                    && request.resource.data.status in ['won', 'lost', 'void']
-                    && changed().hasOnly(['status', 'payout', 'taxed']);
-
+    // ================================================================ stakes/{marketId}_{uid}
+    // Existence is what matters (it bars bettors from voting); placeBet requires it to exist afterwards.
+    match /stakes/{sid} {
+      allow read: if gate();
+      allow create: if gate()
+        && request.resource.data.keys().hasOnly(['marketId', 'uid', 'amount'])
+        && request.resource.data.keys().hasAll(['marketId', 'uid', 'amount'])
+        && request.resource.data.uid == request.auth.uid
+        && validId(request.resource.data.marketId)
+        && sid == request.resource.data.marketId + '_' + request.resource.data.uid
+        && request.resource.data.amount is int && request.resource.data.amount >= 1;
+      allow update: if gate()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['amount'])
+        && request.resource.data.amount is int && request.resource.data.amount > resource.data.amount;
       allow delete: if false;
     }
+
+    // ================================================================ bets2
+    function betCreateOk(bid) {
+      let d = request.resource.data;
+      return gate()
+        && d.keys().hasOnly(['id', 'marketId', 'marketTitle', 'uid', 'username', 'optionId', 'optionLabel', 'amount',
+          'odds', 'placedAt', 'status', 'payout', 'taxed', 'claimedAt'])
+        && d.keys().hasAll(['id', 'marketId', 'marketTitle', 'uid', 'username', 'optionId', 'optionLabel', 'amount',
+          'odds', 'placedAt', 'status', 'payout', 'taxed', 'claimedAt'])
+        && d.id == bid && validId(bid) && d.uid == request.auth.uid
+        && d.status == 'open' && d.payout == 0 && d.taxed == 0 && d.claimedAt == null
+        && d.amount is int && d.amount >= 1
+        && validId(d.marketId) && okStr(d.optionId, 60) && okStr(d.optionLabel, 100) && okStr(d.marketTitle, 200)
+        && okStr(d.username, 40)
+        && nearBet(d.placedAt)
+        && betMarketOk(d, get(M(d.marketId)).data)
+        && betAttached(bid, d);
+    }
+    function betMarketOk(d, m) {
+      return m.status == 'open' && nowMs() < m.closesAt
+        && d.optionId in m.optionIds
+        && d.marketTitle == m.title
+        && (m.mode == 'fixed'
+          ? (d.odds == m.oddsById[d.optionId] && d.odds >= MIN_ODDS() && d.odds <= MAX_ODDS())
+          : d.odds == null);
+    }
+    // the player doc, the market doc and the stake doc must all be written by this same batch
+    function betAttached(bid, d) {
+      return getAfter(P(d.uid)).data.lastBetId == bid
+        && getAfter(P(d.uid)).data.username == d.username
+        && getAfter(M(d.marketId)).data.lastBetId == bid
+        && existsAfter(S(d.marketId + '_' + d.uid));
+    }
+
+    function betClaimOk(bid) {
+      let p = resource.data;
+      let n = request.resource.data;
+      return gate()
+        && p.uid == request.auth.uid && p.status == 'open'
+        && n.diff(p).affectedKeys().hasOnly(['status', 'payout', 'taxed', 'claimedAt'])
+        && n.diff(p).affectedKeys().hasAll(['status', 'claimedAt'])
+        && near(n.claimedAt)
+        && betClaimMatches(bid, p, n, get(M(p.marketId)).data, get(P(p.uid)).data, getAfter(P(p.uid)).data);
+    }
+    function betClaimMatches(bid, b, n, m, pl0, pl1) {
+      return isFinal(m)
+        && n.status == claimStatus(b, m)
+        && n.taxed == taxOf(b, grossOf(b, m), pl0.penaltyUntil)
+        && n.payout == grossOf(b, m) - n.taxed
+        && pl1.balance == pl0.balance + n.payout
+        && pl1.openStake == pl0.openStake - b.amount
+        && pl1.totalWon == pl0.totalWon + (n.status == 'won' ? n.payout : 0)
+        && pl1.lastClaimId == bid
+        && pl1.diff(pl0).affectedKeys().hasOnly(['balance', 'openStake', 'totalWon', 'lastClaimId']);
+    }
+
+    match /bets2/{bid} {
+      allow read: if gate();
+      allow create: if betCreateOk(bid);
+      allow update: if signedIn() && betClaimOk(bid);
+      allow delete: if false;
+    }
+
+    // ================================================================ votes/{marketId}_{uid}
+    function voteCreateOk(vid) {
+      let d = request.resource.data;
+      return gate()
+        && d.keys().hasOnly(['marketId', 'uid', 'uphold', 'at'])
+        && d.keys().hasAll(['marketId', 'uid', 'uphold', 'at'])
+        && d.uid == request.auth.uid && validId(d.marketId)
+        && vid == d.marketId + '_' + d.uid
+        && d.uphold is bool && near(d.at)
+        && voteMarketOk(d, get(M(d.marketId)).data)
+        && getAfter(M(d.marketId)).data.lastVoteId == vid
+        && !exists(S(vid))
+        && exists(P(d.uid));
+    }
+    function voteMarketOk(d, m) {
+      return m.status == 'challenged'
+        && nowMs() < m.challengedAt + VOTE_WINDOW_MS()
+        && d.uid != m.reportedBy && d.uid != m.challengedBy;
+    }
+
+    match /votes/{vid} {
+      allow read: if gate();
+      allow create: if voteCreateOk(vid);
+      allow update, delete: if false;
+    }
+
+    // ================================================================ markets2
+    // --- creation ---------------------------------------------------
+    function dateKey(ts) {
+      return string(ts.year()) + '-' + (ts.month() < 10 ? '0' : '') + string(ts.month()) + '-'
+        + (ts.day() < 10 ? '0' : '') + string(ts.day());
+    }
+    function autoIdOk(mid, tpl) {
+      return tpl is string && tpl.matches('[A-Za-z0-9_-]{1,60}')
+        && (mid == 'auto-' + dateKey(request.time) + '-' + tpl
+          || mid == 'auto-' + dateKey(request.time - duration.value(5, 'm')) + '-' + tpl
+          || mid == 'auto-' + dateKey(request.time + duration.value(5, 'm')) + '-' + tpl);
+    }
+
+    function marketCreateOk(mid) {
+      let d = request.resource.data;
+      return gate()
+        && d.keys().hasOnly(['id', 'type', 'templateId', 'kind', 'mode', 'title', 'description', 'category', 'emoji',
+          'createdBy', 'createdByName', 'openedAt', 'closesAt', 'options', 'optionIds', 'oddsById', 'bucketsById',
+          'expiresAt', 'expiryOptionId', 'reportableAt', 'oracle', 'optionTotals', 'totalPool', 'betCount', 'lastBetId',
+          'status', 'reportedBy', 'reportedByName', 'reportedOptionId', 'reportedEventAt', 'reportedAt', 'evidence',
+          'challengedBy', 'challengedByName', 'challengedAt', 'votesUphold', 'votesOverturn', 'lastVoteId',
+          'resolvedOptionId', 'resolvedAt', 'eventAt', 'reporterBondPaid', 'challengerBondPaid'])
+        && d.keys().hasAll(['id', 'type', 'templateId', 'kind', 'mode', 'title', 'description', 'category', 'emoji',
+          'createdBy', 'createdByName', 'openedAt', 'closesAt', 'options', 'optionIds', 'oddsById', 'bucketsById',
+          'expiresAt', 'expiryOptionId', 'reportableAt', 'oracle', 'optionTotals', 'totalPool', 'betCount', 'lastBetId',
+          'status', 'reportedBy', 'reportedByName', 'reportedOptionId', 'reportedEventAt', 'reportedAt', 'evidence',
+          'challengedBy', 'challengedByName', 'challengedAt', 'votesUphold', 'votesOverturn', 'lastVoteId',
+          'resolvedOptionId', 'resolvedAt', 'eventAt', 'reporterBondPaid', 'challengerBondPaid'])
+        && d.id == mid && validId(mid)
+        && marketFreshOk(d)
+        && marketBodyOk(d)
+        && (d.kind == 'timer' ? timerOk(d) : choiceOk(d))
+        && (d.type == 'auto' ? autoMarketOk(mid, d) : customMarketOk(mid, d));
+    }
+    // brand new: open, empty, nothing reported / challenged / voted / resolved / paid
+    function marketFreshOk(d) {
+      return d.status == 'open'
+        && d.totalPool == 0 && d.betCount == 0 && d.lastBetId == null
+        && d.reportedBy == null && d.reportedByName == null && d.reportedOptionId == null
+        && d.reportedEventAt == null && d.reportedAt == null && d.evidence == null
+        && d.challengedBy == null && d.challengedByName == null && d.challengedAt == null
+        && d.votesUphold == 0 && d.votesOverturn == 0 && d.lastVoteId == null
+        && d.resolvedOptionId == null && d.resolvedAt == null && d.eventAt == null
+        && d.reporterBondPaid == false && d.challengerBondPaid == false;
+    }
+    function marketBodyOk(d) {
+      return (d.kind == 'timer' || d.kind == 'choice')
+        && (d.mode == 'fixed' || d.mode == 'pool')
+        && d.title is string && d.title.size() >= 3 && d.title.size() <= 140
+        && okStr(d.description, 1000) && okStr(d.category, 40) && okStr(d.emoji, 16) && okStr(d.createdByName, 40)
+        && near(d.openedAt)
+        && d.closesAt is number && d.closesAt > nowMs() && d.closesAt > d.openedAt
+        && d.closesAt <= d.openedAt + 400 * DAY_MS()
+        && d.options is list && d.options.size() >= 2 && d.options.size() <= 6
+        && d.optionIds is list && d.optionIds.size() == d.options.size()
+        && d.optionIds.toSet().size() == d.optionIds.size()
+        && d.optionTotals is map
+        && d.optionTotals.keys().toSet() == d.optionIds.toSet()
+        && d.optionTotals.values().toSet() == [0].toSet()
+        && (d.mode == 'fixed'
+          ? (d.oddsById is map && d.oddsById.keys().toSet() == d.optionIds.toSet())
+          : d.oddsById == null)
+        && (d.oracle == null || d.oracle is map);
+    }
+    function choiceOk(d) {
+      return d.bucketsById == null && d.expiresAt == null && d.expiryOptionId == null
+        && d.reportableAt is number && d.reportableAt >= d.closesAt;
+    }
+    // Timer: buckets are offsets from the moment of the BET; the last bet (at closesAt) can still win in the
+    // widest finite bucket, so expiry = closesAt + start of the open-ended bucket. Nobody reported by then =>
+    // the open-ended bucket wins.
+    function timerOk(d) {
+      return d.mode == 'fixed'
+        && d.bucketsById is map && d.bucketsById.keys().toSet() == d.optionIds.toSet()
+        && d.expiryOptionId in d.optionIds
+        && d.bucketsById[d.expiryOptionId].toMs == null
+        && d.bucketsById[d.expiryOptionId].fromMs is number
+        && d.expiresAt == d.closesAt + d.bucketsById[d.expiryOptionId].fromMs
+        && d.reportableAt == d.openedAt;
+    }
+    // House ("auto") market: ADMIN ONLY (nobody else can seed a day's markets with hostile fixed odds).
+    // Id auto-YYYY-MM-DD-template with today's UTC date.
+    function autoMarketOk(mid, d) {
+      return d.type == 'auto' && d.createdBy == 'house' && isAdmin() && autoIdOk(mid, d.templateId);
+    }
+    function customMarketOk(mid, d) {
+      return d.type == 'custom' && d.templateId == null && d.oracle == null
+        && d.createdBy == request.auth.uid
+        && !mid.matches('auto-.*')
+        && (d.kind == 'timer' ? customTimerOk(d) : (d.mode == 'pool' && d.reportableAt == d.closesAt))
+        && customCreatorOk(d, get(P(request.auth.uid)).data, getAfter(P(request.auth.uid)).data);
+    }
+    // Custom timers are pinned to the default buckets and odds (economy.DEFAULT_TIMER_BUCKETS): nobody can
+    // print money by picking absurd fixed odds on their own market.
+    function customTimerOk(d) {
+      return d.optionIds.toSet() == ['d1', 'd4', 'd8', 'never'].toSet()
+        && d.oddsById == {'d1': 6, 'd4': 3, 'd8': 1.8, 'never': 1.3}
+        && d.bucketsById == {
+          'd1': {'fromMs': 0, 'toMs': 86400000},
+          'd4': {'fromMs': 86400000, 'toMs': 345600000},
+          'd8': {'fromMs': 345600000, 'toMs': 691200000},
+          'never': {'fromMs': 691200000, 'toMs': null}}
+        && d.expiryOptionId == 'never';
+    }
+    // the creator's player doc is bumped (marketsDay / marketsCount) in the same batch; kMarkets caps it at 5/day
+    function customCreatorOk(d, p0, p1) {
+      return d.createdByName == p1.username
+        && (p1.marketsDay > p0.marketsDay || p1.marketsCount == p0.marketsCount + 1);
+    }
+
+    // --- transitions ------------------------------------------------
+    // placeBet companion: totals +amount for the bet's option, betCount +1, lastBetId = the (new) bet
+    function kBetApply(mid, ch) {
+      let n = request.resource.data;
+      return ch.hasOnly(['optionTotals', 'totalPool', 'betCount', 'lastBetId'])
+        && ch.hasAll(['optionTotals', 'totalPool', 'betCount', 'lastBetId'])
+        && validId(n.lastBetId)
+        && !exists(B(n.lastBetId))
+        && betApplyMatches(mid, n, resource.data, getAfter(B(n.lastBetId)).data);
+    }
+    function betApplyMatches(mid, n, p, b) {
+      return b.marketId == mid
+        && n.optionTotals.diff(p.optionTotals).affectedKeys().hasOnly([b.optionId])
+        && n.optionTotals[b.optionId] == p.optionTotals[b.optionId] + b.amount
+        && n.totalPool == p.totalPool + b.amount
+        && n.betCount == p.betCount + 1;
+    }
+
+    // vote companion: one counter +1, lastVoteId = the (new) vote
+    function kVoteApply(mid, ch) {
+      let n = request.resource.data;
+      return ch.hasOnly(['votesUphold', 'votesOverturn', 'lastVoteId'])
+        && ch.hasAll(['lastVoteId'])
+        && validId(n.lastVoteId)
+        && !exists(V(n.lastVoteId))
+        && voteApplyMatches(mid, n, resource.data, getAfter(V(n.lastVoteId)).data);
+    }
+    function voteApplyMatches(mid, n, p, v) {
+      return v.marketId == mid && p.status == 'challenged'
+        && (v.uphold
+          ? (n.votesUphold == p.votesUphold + 1 && n.votesOverturn == p.votesOverturn)
+          : (n.votesOverturn == p.votesOverturn + 1 && n.votesUphold == p.votesUphold));
+    }
+
+    // reportResult: open -> reported, reporter pays the bond
+    function kReport(mid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['status', 'reportedBy', 'reportedByName', 'reportedOptionId', 'reportedEventAt',
+          'reportedAt', 'evidence'])
+        && ch.hasAll(['status', 'reportedBy', 'reportedByName', 'reportedAt'])
+        && gate()
+        && p.status == 'open' && n.status == 'reported'
+        && n.reportedBy == request.auth.uid
+        && (p.type == 'auto' || p.createdBy == request.auth.uid)
+        && nowMs() >= p.reportableAt
+        && near(n.reportedAt)
+        && (n.evidence == null || (n.evidence is string && n.evidence.size() <= 300))
+        && (p.kind == 'timer'
+          // timer: only WHEN it happened is reported; eventAt in [openedAt, now]
+          ? (n.reportedOptionId == null && n.reportedEventAt is number
+              && n.reportedEventAt >= p.openedAt && n.reportedEventAt <= nowMs())
+          : (n.reportedOptionId in p.optionIds && n.reportedEventAt == null))
+        && bondPaid(request.auth.uid, n.reportedByName, mid);
+    }
+    // the caller's player doc goes down by BOND and points at this market
+    function bondPaid(uid, name, mid) {
+      return bondPaidMatches(uid, name, mid, get(P(uid)).data, getAfter(P(uid)).data);
+    }
+    function bondPaidMatches(uid, name, mid, p0, p1) {
+      return p1.balance == p0.balance - BOND() && p1.balance >= 0
+        && p1.lastBondMarketId == mid
+        && p1.username == name
+        && p1.diff(p0).affectedKeys().hasOnly(['balance', 'lastBondMarketId']);
+    }
+
+    // challenge: reported -> challenged inside the 12h window, challenger pays the bond
+    function kChallenge(mid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['status', 'challengedBy', 'challengedByName', 'challengedAt'])
+        && ch.hasAll(['status', 'challengedBy', 'challengedByName', 'challengedAt'])
+        && gate()
+        && p.status == 'reported' && n.status == 'challenged'
+        && nowMs() < p.reportedAt + CHALLENGE_WINDOW_MS()
+        && n.challengedBy == request.auth.uid && n.challengedBy != p.reportedBy
+        && near(n.challengedAt)
+        && bondPaid(request.auth.uid, n.challengedByName, mid);
+    }
+
+    // finalize (anyone, idempotent), plus the creator voiding an empty market
+    function kFinalize(mid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['status', 'resolvedOptionId', 'resolvedAt', 'eventAt'])
+        && ch.hasAll(['status', 'resolvedAt'])
+        && gate()
+        && near(n.resolvedAt)
+        && finalizeShape(p, n);
+    }
+    function finalizeShape(p, n) {
+      return (p.status == 'open' && (
+            (p.kind == 'timer' && p.expiresAt != null && nowMs() >= p.expiresAt
+              && n.status == 'resolved' && n.resolvedOptionId == p.expiryOptionId && n.eventAt == null)
+            || (p.type == 'custom' && p.createdBy == request.auth.uid && p.betCount == 0
+              && n.status == 'void' && n.resolvedOptionId == null && n.eventAt == null)))
+        || (p.status == 'reported' && nowMs() >= p.reportedAt + CHALLENGE_WINDOW_MS()
+            && finalizeReported(p, n))
+        || (p.status == 'challenged' && nowMs() >= p.challengedAt + VOTE_WINDOW_MS()
+            && (p.votesUphold > p.votesOverturn
+              ? finalizeReported(p, n)
+              : (n.status == 'void' && n.resolvedOptionId == null && n.eventAt == null)));
+    }
+    // a pool market whose reported option has no money on it cannot pay anyone: void it
+    function finalizeReported(p, n) {
+      return (p.mode == 'pool' && p.optionTotals[p.reportedOptionId] == 0)
+        ? (n.status == 'void' && n.resolvedOptionId == null && n.eventAt == null)
+        : (n.status == 'resolved' && n.resolvedOptionId == p.reportedOptionId && n.eventAt == p.reportedEventAt);
+    }
+
+    // claimBond: flip the paid flag, the player doc gets the payout in the same batch
+    function kBondClaimM(mid, ch) {
+      let n = request.resource.data;
+      let p = resource.data;
+      return ch.hasOnly(['reporterBondPaid', 'challengerBondPaid'])
+        && ch.hasAny(['reporterBondPaid', 'challengerBondPaid'])
+        && gate()
+        && isFinal(p)
+        && (ch.hasOnly(['reporterBondPaid'])
+          ? (p.reportedBy == request.auth.uid && p.reporterBondPaid == false && n.reporterBondPaid == true
+              && bondCredited(request.auth.uid, mid, bondReporter(p)))
+          : (ch.hasOnly(['challengerBondPaid'])
+              && p.challengedBy == request.auth.uid && p.challengerBondPaid == false && n.challengerBondPaid == true
+              && bondCredited(request.auth.uid, mid, bondChallenger(p))));
+    }
+    function bondCredited(uid, mid, amount) {
+      return bondCreditedMatches(mid, amount, get(P(uid)).data, getAfter(P(uid)).data);
+    }
+    function bondCreditedMatches(mid, amount, p0, p1) {
+      return p1.balance == p0.balance + amount
+        && (amount == 0 || p1.lastBondMarketId == mid)
+        && p1.diff(p0).affectedKeys().hasOnly(['balance', 'lastBondMarketId']);
+    }
+
+    function marketUpdateOk(mid, ch) {
+      return ch.hasAny(['optionTotals']) ? kBetApply(mid, ch)
+        : (ch.hasAny(['lastVoteId']) ? kVoteApply(mid, ch)
+        : (ch.hasAny(['reportedBy']) ? kReport(mid, ch)
+        : (ch.hasAny(['challengedBy']) ? kChallenge(mid, ch)
+        : (ch.hasAny(['reporterBondPaid', 'challengerBondPaid']) ? kBondClaimM(mid, ch)
+        : kFinalize(mid, ch)))));
+    }
+
+    match /markets2/{mid} {
+      allow read: if gate();
+      allow create: if marketCreateOk(mid);
+      allow update: if signedIn()
+        && marketUpdateOk(mid, request.resource.data.diff(resource.data).affectedKeys());
+      allow delete: if false;
+    }
+
+    // Everything else (including the old v1 collections users/usernames/markets/bets) is closed.
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Operations (each is ONE batch / transaction; "primary" = the doc whose rule carries the checks)
+//
+//  signUp / repair   create handles/{lower} + players/{uid}
+//  placeBet          create bets2/{b} (primary) + update players/{me} (kBet) + set stakes/{m}_{me}
+//                    + update markets2/{m} (kBetApply)
+//  createMarket      create markets2/{id} (primary) + update players/{me} (kMarkets)   [house markets: alone]
+//  reportResult      update markets2/{m} (kReport, primary) + update players/{me} (kBondPay)
+//  challenge         update markets2/{m} (kChallenge, primary) + update players/{me} (kBondPay)
+//  vote              create votes/{m}_{me} (primary) + update markets2/{m} (kVoteApply)
+//  finalize / void   update markets2/{m} (kFinalize)
+//  claimBet          update bets2/{b} (primary) + update players/{me} (kClaim)
+//  claimBond         update markets2/{m} (kBondClaimM, primary) + update players/{me} (kBondClaim)  [amount 0: market only]
+//  markBroke         update players/{me} (kBroke)
+//  claimRestart      update players/{me} (kRestart)
+//  claimAdmin        set app/claim {code} + create app/config   (then delete app/claim)
+//  setMaintenance    update app/config; ban / unban: create / delete bans/{uid} (admin only)
+// ---------------------------------------------------------------------------------------------

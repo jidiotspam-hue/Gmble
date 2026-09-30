@@ -1,674 +1,666 @@
-// Integration tests for js/store/firebase.js and firestore.rules against the REAL Firestore + Auth
-// emulators. They are SKIPPED unless the emulators are running and the npm firebase SDK is available,
-// so plain `node --test` (no deps, no network) stays green.
+// Happy-path integration tests for js/store/firebase.js + firestore.rules (v2) against the REAL Firestore and
+// Auth emulators, with several independent clients. They are SKIPPED (not failed) unless the emulators are
+// running and the npm firebase SDK is available, so plain `node --test` (no deps, no network) stays green.
+// The attack tests live in tests/rules-attacks.test.mjs; the shared harness in tests/rules-helpers.mjs.
 //
 // To run them (needs Java 11+ and Node 20+; nothing is installed into the repo):
 //   mkdir /tmp/fb && cd /tmp/fb && npm init -y && npm i firebase@10.12.2 firebase-tools
 //   cat > firebase.json   # {"firestore":{"rules":"<repo>/firestore.rules"},
 //                         #  "emulators":{"auth":{"port":9099},"firestore":{"port":8080},"ui":{"enabled":false}}}
 //   npx firebase emulators:start --only auth,firestore --project demo-sonnetous &
-//   FB_SDK_DIR=/tmp/fb node --test --test-force-exit tests/firebase-store.test.mjs
-import test, { beforeEach, after } from 'node:test';
+//   FB_SDK_DIR=/tmp/fb node --test --test-force-exit tests/
+// The tests load a TEST copy of firestore.rules into the emulator (admin code 'test-admin-code', 12h/24h
+// windows -> 4s, bailout day -> 4s). Real time is used (rules compare against server time), so the suite takes
+// a minute or two.
+import test, { before, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import path from 'node:path';
+import fs from 'node:fs';
 import { createFirebaseStore } from '../js/store/firebase.js';
 import * as economy from '../js/economy.js';
+import * as templates from '../js/templates.js';
+import {
+  fbConfig, emulator, loadEnv, pushRules, acquireLock, releaseLock, resetEmulator, adminList, adminGet, adminPatch, sleep, until,
+  TEST_ADMIN_CODE, TEST_CHALLENGE_WINDOW_MS, TEST_VOTE_WINDOW_MS, TEST_BAILOUT_DAY_MS,
+} from './rules-helpers.mjs';
 
-const PROJECT = 'demo-sonnetous';
-const EMU_HOST = process.env.FIRESTORE_EMULATOR_HOST || '127.0.0.1:8080';
-const AUTH_HOST = process.env.FIREBASE_AUTH_EMULATOR_HOST || '127.0.0.1:9099';
-const [FS_H, FS_P] = EMU_HOST.split(':');
-
-let sdk = null;
-let skip = false;
-try {
-  if (!process.env.FB_SDK_DIR) throw new Error('set FB_SDK_DIR to a directory with node_modules/firebase@10.12.2');
-  const req = createRequire(path.join(process.env.FB_SDK_DIR, 'noop.js'));
-  sdk = { app: req('firebase/app'), auth: req('firebase/auth'), firestore: req('firebase/firestore') };
-  const ping = await fetch(`http://${EMU_HOST}/`, { signal: AbortSignal.timeout(1500) });
-  if (!ping.ok) throw new Error('Firestore emulator not reachable');
-} catch (err) {
-  skip = 'Firebase emulator tests skipped: ' + (err && err.message);
-}
-const test0 = test;
-const it = (name, fn) => test0(name, { skip }, fn);
-const fbApp = sdk && sdk.app; const fbAuth = sdk && sdk.auth; const fbFs = sdk && sdk.firestore;
-const F = fbFs;
-
+const { sdk, skip } = await loadEnv();
+const it = (name, fn) => test(name, { skip, timeout: 120000 }, fn);
 const { DAY_MS, HOUR_MS } = economy;
-const T0 = Date.UTC(2026, 0, 10, 12, 0, 0);
-const emulator = { authUrl: `http://${AUTH_HOST}`, firestoreHost: FS_H, firestorePort: Number(FS_P) };
-const config = { apiKey: 'fake', projectId: PROJECT, authDomain: 'x' };
-const REST = `http://${EMU_HOST}/v1/projects/${PROJECT}/databases/(default)/documents`;
+const todayKey = () => economy.utcDayKey(Date.now());
 
-let clock = { t: T0 };
+before(async () => { if (skip) return; await acquireLock(); await pushRules(); });
+after(async () => { if (skip) return; releaseLock(); });
+
 let n = 0;
-const clients = [];
-async function client(label = 'c') {
-  const store = await createFirebaseStore(config, { sdk, emulator, appName: `${label}${++n}`, now: () => clock.t });
+let clients = [];
+// decisionNow is far ahead so the store's own "is the 12h/24h window over" checks never hide what the RULES say
+// (the rules use the shortened test windows and the real server clock).
+async function client(label = 'c', extra = {}) {
+  const store = await createFirebaseStore(fbConfig, {
+    sdk, emulator, appName: `${label}${++n}`, now: () => Date.now(), decisionNow: () => Date.now() + 26 * HOUR_MS, ...extra,
+  });
   clients.push(store);
   await store.init();
   return store;
 }
+beforeEach(async () => { if (!skip) { await resetEmulator(); clients = []; } });
+afterEach(async () => { if (skip) return; for (const c of clients) { try { await c.signOut(); } catch { /* ignore */ } await c._dispose(); } });
 
-beforeEach(async () => {
-  if (skip) return;
-  clock = { t: T0 };
-  await fetch(`http://${EMU_HOST}/emulator/v1/projects/${PROJECT}/databases/(default)/documents`, { method: 'DELETE' });
-  await fetch(`http://${AUTH_HOST}/emulator/v1/projects/${PROJECT}/accounts`, { method: 'DELETE' });
+// ---- small helpers
+const first = (store, sub, pred = () => true, ms = 8000) => new Promise((res, rej) => {
+  let off = null; let done = false;
+  const timer = setTimeout(() => { if (!done) { done = true; off && off(); rej(new Error(`no ${sub} snapshot matched`)); } }, ms);
+  off = store[sub]((d) => {
+    if (done || !pred(d)) return;
+    done = true; clearTimeout(timer); setTimeout(() => off && off(), 0); res(d);
+  });
 });
-after(async () => {
-  if (skip) return;
-  for (const c of clients) { try { await c.signOut(); } catch {} }
-});
+const me = (store, pred) => first(store, 'onAuthChange', (u) => (pred ? pred(u) : !!u));
+const player = (uid) => adminGet('players', uid);
+const market = (id) => adminGet('markets2', id);
+const bet = (id) => adminGet('bets2', id);
 
-// ---- admin-privileged ground truth via REST (Authorization: Bearer owner bypasses rules)
-function dec(v) {
-  if ('nullValue' in v) return null;
-  if ('integerValue' in v) return Number(v.integerValue);
-  if ('doubleValue' in v) return v.doubleValue;
-  if ('stringValue' in v) return v.stringValue;
-  if ('booleanValue' in v) return v.booleanValue;
-  if ('arrayValue' in v) return (v.arrayValue.values || []).map(dec);
-  if ('mapValue' in v) return Object.fromEntries(Object.entries(v.mapValue.fields || {}).map(([k, x]) => [k, dec(x)]));
-  throw new Error('unknown ' + JSON.stringify(v));
+/** Fresh world: admin claims the game (test code) and opens it. Returns the admin store. */
+let ADMIN = null; // the admin store of the current world: only the admin may create house markets
+async function openGame() {
+  const admin = await client('admin');
+  ADMIN = admin;
+  await assert.rejects(admin.signUp('Admin', 'secret1'), /down for maintenance/);
+  await admin.claimAdmin(TEST_ADMIN_CODE);
+  await admin.setMaintenance(false);
+  return admin;
 }
-async function adminList(coll) {
-  const out = [];
-  let tok = '';
-  do {
-    const r = await fetch(`${REST}/${coll}?pageSize=300${tok ? '&pageToken=' + tok : ''}`, { headers: { Authorization: 'Bearer owner' } });
-    const j = await r.json();
-    for (const d of j.documents || []) out.push({ _id: d.name.split('/').pop(), ...dec({ mapValue: { fields: d.fields } }) });
-    tok = j.nextPageToken || '';
-  } while (tok);
-  return out;
+/** Signs up `name` on a new client. Returns { s, uid, name }. */
+async function join(name) {
+  const s = await client(name);
+  const p = await s.signUp(name, 'secret1');
+  return { s, uid: p.uid, name };
 }
-const adminUser = async (name) => (await adminList('users')).find((u) => u.username === name);
-const adminMarket = async (id) => (await adminList('markets')).find((m) => m.id === id);
-const adminBets = async (marketId) => (await adminList('bets')).filter((b) => !marketId || b.marketId === marketId);
+async function until2(fn) { return until(fn, 6000); }
 
-const currentUser = (store) => new Promise((res) => { const off = store.onAuthChange((u) => { off(); res(u); }); });
-const collect = (store) => { const seen = []; const off = store.onAuthChange((u) => seen.push(u)); return { seen, off }; };
-async function until(fn, ms = 8000) {
-  const end = Date.now() + ms;
-  for (;;) {
-    try { const v = await fn(); if (v) return v; } catch (e) { if (Date.now() > end) throw e; }
-    if (Date.now() > end) throw new Error('until timed out');
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
-const first = (store, sub, pred = () => true) => until(() => new Promise((res, rej) => {
-  let off; let done = false;
-  off = store[sub]((d) => { if (!done && pred(d)) { done = true; setTimeout(() => off && off(), 0); res(d); } });
-  setTimeout(() => { if (!done) { done = true; off && off(); rej(new Error('no snapshot')); } }, 1500);
-}));
-
-function customMarket(user, now, over = {}) {
+function choiceMarket(p, id, opts = {}) {
+  const now = Date.now();
   return economy.buildCustomMarket({
-    id: over.id || 'm1', user, now, title: 'Will it rain tomorrow?', description: '',
-    kind: 'choice', optionLabels: ['Yes', 'No'], closesAt: now + DAY_MS, ...over,
+    id, player: { uid: p.uid, username: p.name }, now, title: `Will ${id} happen?`, description: '', kind: 'choice',
+    optionLabels: ['Yes', 'No'], closesAt: now + (opts.closeInMs ?? 4000),
   });
 }
-function autoTimerMarket(now, id = 'auto-2026-01-10-test') {
-  const m = economy.buildCustomMarket({
-    id, user: { uid: 'house', username: 'The House' }, now,
-    title: 'How long till the test passes?', description: '', kind: 'timer',
+// A short-lived house timer market: buckets [0,3s) and [3s,inf), betting closes after `closeInMs`.
+function houseTimer(tpl, opts = {}) {
+  const now = Date.now();
+  const closeInMs = opts.closeInMs ?? 2500;
+  return economy.normalizeMarket({
+    id: `auto-${todayKey()}-${tpl}`, type: 'auto', templateId: tpl, kind: 'timer', mode: 'fixed', title: `Timer ${tpl}`,
+    description: 'Counts if: test.', category: 'Test', emoji: '⏱️', createdBy: 'house', createdByName: 'The House',
+    openedAt: now, closesAt: now + closeInMs, expiresAt: now + closeInMs + 3000,
+    options: [
+      { id: 'quick', label: 'Within 3s', odds: 3, fromDays: 0, toDays: 3000 / DAY_MS },
+      { id: 'never', label: 'Later', odds: 1.5, fromDays: 3000 / DAY_MS, toDays: null },
+    ],
   });
-  return { ...m, type: 'auto', templateId: 'test', createdBy: 'house', createdByName: 'The House' };
 }
+const waitUntil = async (ms) => { const d = ms - Date.now(); if (d > 0) await sleep(d + 30); };
 
-it('sign up / sign in, no transient null during sign-up', async () => {
-  const s = await client();
-  assert.deepEqual(await s.init(), { mode: 'firebase' });
-  const { seen, off } = collect(s);
-  await until(() => seen.length === 1);
-  assert.equal(seen[0], null);
+// -----------------------------------------------------------------------------------------------
+it('bootstrap: closed game, admin claim, maintenance on/off, sign-up gate', async () => {
+  const a = await client('admin');
+  const cfg0 = await first(a, 'subscribeConfig');
+  assert.deepEqual(cfg0, { exists: false, maintenance: true, adminUid: null }, 'no config = closed, readable signed out');
+  assert.deepEqual(await first(a, 'onAuthChange'), null);
+
+  // Sign-up while closed: the Auth account is kept, no player is created.
+  await assert.rejects(a.signUp('Admin', 'secret1'), /down for maintenance/);
+  const sess = await first(a, 'onSessionChange', (s) => !!s);
+  assert.equal(sess.username, 'Admin');
+  assert.equal((await adminList('players')).length, 0);
+  assert.deepEqual(await first(a, 'onAuthChange'), null);
+
+  await assert.rejects(a.claimAdmin('wrong-code'), /not the admin code/);
+  assert.equal((await adminList('app')).filter((d) => d._id === 'config').length, 0);
+  await a.claimAdmin(TEST_ADMIN_CODE);
+  const cfg = await first(a, 'subscribeConfig', (c) => c.exists);
+  assert.equal(cfg.maintenance, true);
+  assert.equal(cfg.adminUid, sess.uid);
+  const cfgDoc = await adminGet('app', 'config');
+  assert.deepEqual(Object.keys(cfgDoc).sort(), ['_id', 'adminUid', 'maintenance', 'updatedAt'], 'the code is not stored in the public config');
+  assert.equal(await adminGet('app', 'claim'), null, 'plaintext code wiped');
+  // The admin bypasses maintenance and got a player (+handle) right away.
+  const ap = await first(a, 'onAuthChange', (u) => !!u);
+  assert.equal(ap.username, 'Admin');
+  assert.equal(ap.balance, 500);
+  assert.equal((await adminGet('handles', 'admin')).uid, ap.uid);
+  await assert.rejects(a.claimAdmin(TEST_ADMIN_CODE), /already been claimed/);
+
+  // Others cannot get in during maintenance, but their session survives.
+  const b = await client('b');
+  await assert.rejects(b.signUp('Bobby', 'secret1'), /down for maintenance/);
+  assert.equal((await adminList('players')).length, 1);
+  await b.signOut();
+  await assert.rejects(b.signIn('Bobby', 'secret1'), /down for maintenance/);
+  assert.equal((await first(b, 'onSessionChange', (s) => !!s)).username, 'Bobby');
+  assert.deepEqual(await first(b, 'subscribeMarkets'), [], 'empty list while closed');
+  await assert.rejects(b.placeBet('x', 'o1', 5), /down for maintenance/);
+
+  // Non-admin cannot toggle maintenance / ban
+  await assert.rejects(b.setMaintenance(false), /Only the admin/);
+  await assert.rejects(b.banPlayer(ap.uid, 'x'), /Only the admin/);
+
+  // Open the game: b (already signed in) gets a player through the repair path, no re-login needed.
+  await a.setMaintenance(false);
+  const bp = await first(b, 'onAuthChange', (u) => !!u);
+  assert.equal(bp.username, 'Bobby');
+  assert.equal((await player(bp.uid)).balance, 500);
+  assert.deepEqual((await first(b, 'subscribePlayers', (l) => l.length === 2)).map((p) => p.username).sort(), ['Admin', 'Bobby']);
+
+  // Maintenance on again: everything shuts, listeners go empty and come back.
+  await a.setMaintenance(true);
+  assert.deepEqual(await first(b, 'onAuthChange', (u) => u === null), null);
+  assert.deepEqual(await first(b, 'subscribePlayers', (l) => l.length === 0), []);
+  await assert.rejects(b.markBrokeIfNeeded(), /down for maintenance/);
+  await a.setMaintenance(false);
+  assert.equal((await first(b, 'onAuthChange', (u) => !!u)).username, 'Bobby');
+  assert.equal((await first(b, 'subscribePlayers', (l) => l.length === 2)).length, 2);
+});
+
+it('ban / unban', async () => {
+  const admin = await openGame();
+  const alice = await join('alice');
+  const bob = await join('bob');
+  await assert.rejects(alice.s.banPlayer(bob.uid, 'nope'), /Only the admin/);
+  const adminUid = (await first(admin, 'onAuthChange')).uid;
+  await assert.rejects(admin.banPlayer(adminUid, 'lol'), /can't ban the admin/);
+  await admin.banPlayer(bob.uid, 'cheating at cards');
+  const ban = await first(bob.s, 'subscribeMyBan', (b) => !!b);
+  assert.equal(ban.reason, 'cheating at cards');
+  assert.equal(ban.username, 'bob');
+  assert.deepEqual(await first(bob.s, 'onAuthChange', (u) => u === null), null);
+  assert.deepEqual(await first(bob.s, 'subscribeMarkets'), []);
+  await assert.rejects(bob.s.placeBet('x', 'o1', 5), /banned/);
+  await assert.rejects(bob.s.markBrokeIfNeeded(), /banned/);
+  await bob.s.signOut();
+  await assert.rejects(bob.s.signIn('bob', 'secret1'), /banned/);
+  assert.equal((await first(admin, 'subscribeBans', (l) => l.length === 1))[0].uid, bob.uid);
+  assert.deepEqual(await first(alice.s, 'subscribeBans'), [], 'non-admin sees no bans');
+  // The admin can still play; alice is unaffected
+  assert.ok(await me(alice.s));
+  await admin.unbanPlayer(bob.uid);
+  await bob.s.signIn('bob', 'secret1');
+  assert.equal((await first(bob.s, 'onAuthChange', (u) => !!u)).username, 'bob');
+  assert.deepEqual(await first(bob.s, 'subscribeMyBan'), null);
+  await bob.s.markBrokeIfNeeded();
+});
+
+it('sign-up validation, taken names, repair path for an Auth account without a player doc', async () => {
+  await openGame();
+  const s = await client('u');
+  await assert.rejects(s.signUp('a!', 'secret1'), /Username/);
+  await assert.rejects(s.signUp('bobby', '123'), /Password/);
   const u = await s.signUp('Alice', 'secret1');
   assert.equal(u.username, 'Alice');
   assert.equal(u.balance, 500);
-  await until(() => seen.length >= 2);
-  await new Promise((r) => setTimeout(r, 300));
-  assert.ok(seen.slice(1).every((x) => x && x.uid === u.uid), 'no null after the initial one: ' + JSON.stringify(seen.map((x) => x && x.username)));
-  off();
-  assert.equal((await currentUser(s)).uid, u.uid);
+  assert.equal((await adminGet('handles', 'alice')).uid, u.uid);
+  const t = await client('t');
+  await assert.rejects(t.signUp('alice', 'another1'), /taken/i);
+  assert.equal(await first(t, 'onSessionChange'), null, 'failed sign-up leaves no session');
+  await assert.rejects(t.signIn('Alice', 'wrong-pass'), /Invalid username or password/);
+  await t.signIn('ALICE', 'secret1');
+  assert.equal((await first(t, 'onAuthChange', (x) => !!x)).uid, u.uid);
 
-  await assert.rejects(s.signUp('alice', 'another1'), /taken/i);
-  await assert.rejects(s.signUp('a!', 'secret1'), /username/i);
-  await assert.rejects(s.signUp('bobby', '123'), /password/i);
-  assert.equal((await currentUser(s)).uid, u.uid, 'failed sign-up must not change session');
-
-  await s.signOut();
-  assert.equal(await currentUser(s), null);
-  await assert.rejects(s.signIn('alice', 'wrongpw'), /invalid username or password/i);
-  await assert.rejects(s.signIn('nobody', 'secret1'), /invalid username or password/i);
-  const again = await s.signIn('ALICE', 'secret1');
-  assert.equal(again.uid, u.uid);
-  assert.equal(again.username, 'Alice');
-  assert.equal((await currentUser(s)).username, 'Alice');
-
-  // second client, same username in different case
-  const s2 = await client();
-  await assert.rejects(s2.signUp('ALICE', 'another1'), /taken/i);
-  assert.equal(await currentUser(s2), null);
+  // Repair: an Auth account that never got a player (interrupted sign-up), created behind the store's back.
+  const raw = sdk.app.initializeApp(fbConfig, 'raw-auth');
+  const rawAuth = sdk.auth.getAuth(raw);
+  sdk.auth.connectAuthEmulator(rawAuth, emulator.authUrl, { disableWarnings: true });
+  const cred = await sdk.auth.createUserWithEmailAndPassword(rawAuth, 'ghosty@users.sonnetous.app', 'secret1');
+  await sdk.auth.updateProfile(cred.user, { displayName: 'Ghosty' });
+  await sdk.app.deleteApp(raw);
+  assert.equal(await adminGet('players', cred.user.uid), null);
+  const g = await client('g');
+  const gp = await g.signIn('ghosty', 'secret1');
+  assert.equal(gp.uid, cred.user.uid);
+  assert.equal(gp.username, 'Ghosty');
+  assert.equal(gp.balance, 500);
+  assert.equal((await adminGet('handles', 'ghosty')).uid, cred.user.uid);
+  // ...and the same through the auth stream alone (session restored, no signIn call)
+  const raw2 = sdk.app.initializeApp(fbConfig, 'raw-auth2');
+  const rawAuth2 = sdk.auth.getAuth(raw2);
+  sdk.auth.connectAuthEmulator(rawAuth2, emulator.authUrl, { disableWarnings: true });
+  const cred2 = await sdk.auth.createUserWithEmailAndPassword(rawAuth2, 'phantom@users.sonnetous.app', 'secret1');
+  // 'phantom' has no displayName: the name comes from the synthetic email
+  const watcher = await createFirebaseStore(fbConfig, { sdk, emulator, appName: 'watch1', now: () => Date.now() });
+  clients.push(watcher);
+  await watcher.signIn('phantom', 'secret1'); // repair inside signIn
+  assert.equal((await player(cred2.user.uid)).username, 'phantom');
+  await sdk.app.deleteApp(raw2);
 });
 
-it('sign-up rollback: taken username claim (orphan usernames doc) leaves nothing behind', async () => {
-  // Orphan usernames/ghost claimed by someone else with no auth account for it.
-  const a = await client();
-  const alice = await a.signUp('alice', 'secret1');
-  // Manually claim 'ghost' -> alice's uid via a raw admin write
-  await fetch(`${REST}/usernames?documentId=ghost`, {
-    method: 'POST', headers: { Authorization: 'Bearer owner', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields: { uid: { stringValue: alice.uid } } }),
-  });
-  const b = await client();
-  await assert.rejects(b.signUp('ghost', 'secret1'), /taken/i);
-  assert.equal(await currentUser(b), null);
-  // auth account rolled back -> can sign up with that name?? still taken by usernames doc, but auth is free
-  await assert.rejects(b.signIn('ghost', 'secret1'), /invalid/i);
-});
-
-it('placing a bet debits balance, updates market totals; cannot overbet; feed sorted', async () => {
-  const s = await client();
-  const alice = await s.signUp('alice', 'secret1');
-  await s.createMarket(customMarket(alice, clock.t));
-  const seen = [];
-  const off = s.onAuthChange((u) => seen.push(u && u.balance));
-  await until(() => seen.length >= 1);
-  const bet = await s.placeBet('m1', 'o1', 100);
-  await until(() => seen.includes(400));
-  off();
-  assert.equal(bet.amount, 100);
-  assert.equal(bet.uid, alice.uid);
-  assert.equal(bet.status, 'open');
-  const u = await adminUser('alice');
-  assert.equal(u.balance, 400);
-  assert.equal(u.totalWagered, 100);
-  const m = await adminMarket('m1');
-  assert.equal(m.totalPool, 100);
-  assert.equal(m.optionTotals.o1, 100);
-  assert.equal(m.betCount, 1);
-  await assert.rejects(s.placeBet('m1', 'o2', 401), /enough/i);
-  await assert.rejects(s.placeBet('m1', 'o2', 0));
-  await assert.rejects(s.placeBet('m1', 'o2', 1.5));
-  await assert.rejects(s.placeBet('m1', 'nope', 5));
-  await assert.rejects(s.placeBet('missing', 'o1', 5), /not found/i);
-  assert.equal((await adminUser('alice')).balance, 400);
-  clock.t += 2 * DAY_MS;
-  await assert.rejects(s.placeBet('m1', 'o1', 5), /closed/i);
-  assert.equal((await adminBets()).length, 1);
-});
-
-it('subscriptions: markets newest openedAt first, bets newest placedAt first, users', async () => {
-  const s = await client();
-  const alice = await s.signUp('alice', 'secret1');
-  for (let i = 0; i < 4; i++) {
-    clock.t = T0 + i * 1000;
-    await s.createMarket(customMarket(alice, clock.t, { id: 'm' + i, closesAt: T0 + 5 * DAY_MS }));
-  }
-  for (let i = 0; i < 4; i++) { clock.t = T0 + 10000 + i * 1000; await s.placeBet('m' + ((i * 3) % 4), 'o1', 10 + i); }
-  const ms = await first(s, 'subscribeMarkets', (d) => d.length === 4);
-  assert.deepEqual(ms.map((m) => m.id), ['m3', 'm2', 'm1', 'm0']);
-  const bs = await first(s, 'subscribeBets', (d) => d.length === 4);
-  assert.deepEqual(bs.map((b) => b.amount), [13, 12, 11, 10]);
-  assert.ok(bs.every((b) => b.id && typeof b.id === 'string'));
-  const us = await first(s, 'subscribeUsers', (d) => d.length === 1);
-  assert.equal(us[0].uid, alice.uid);
-});
-
-it('resolve settles pool market across three clients (cross-user balance writes)', async () => {
-  const A = await client('A'); const B = await client('B'); const C = await client('C');
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await B.signUp('bob', 'secret1');
-  await B.placeBet('m1', 'o1', 100);
-  await C.signUp('carol', 'secret1');
-  await C.placeBet('m1', 'o2', 100);
-
-  await A.resolveMarket('m1', 'o1');
-  const m = await adminMarket('m1');
-  assert.equal(m.status, 'resolved');
-  assert.equal(m.resolvedOptionId, 'o1');
-  assert.equal(m.resolvedBy, 'alice');
-  assert.equal((await adminUser('bob')).balance, 600);
-  assert.equal((await adminUser('bob')).totalWon, 200);
-  assert.equal((await adminUser('carol')).balance, 400);
-  assert.deepEqual((await adminBets('m1')).map((b) => b.status).sort(), ['lost', 'won']);
-  // bob's own client sees the new balance through onAuthChange
-  await until(async () => (await currentUser(B)).balance === 600);
-  await assert.rejects(A.resolveMarket('m1', 'o2'), /already/i);
-  await assert.rejects(B.resolveMarket('m1', 'o2'), /creator|already/i);
-  assert.equal((await adminUser('bob')).balance, 600);
-});
-
-it('custom market only resolved / voided by creator; cannot create as someone else', async () => {
-  const A = await client(); const B = await client();
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await B.signUp('bob', 'secret1');
-  await assert.rejects(B.resolveMarket('m1', 'o1'), /creator/i);
-  await assert.rejects(B.voidMarket('m1'), /creator/i);
-  assert.equal((await adminMarket('m1')).status, 'open');
-  await assert.rejects(B.createMarket(customMarket(alice, clock.t, { id: 'm2' })), /yourself/i);
-  await assert.rejects(A.createMarket(customMarket(alice, clock.t)), /already exists/i);
-});
-
-it('creator can void a market and everyone is refunded', async () => {
-  const A = await client(); const B = await client();
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await A.placeBet('m1', 'o1', 50);
-  await B.signUp('bob', 'secret1');
-  await B.placeBet('m1', 'o2', 70);
-  assert.equal((await adminUser('bob')).balance, 430);
-  await A.voidMarket('m1');
-  assert.equal((await adminMarket('m1')).status, 'void');
-  assert.equal((await adminUser('alice')).balance, 500);
-  assert.equal((await adminUser('bob')).balance, 500);
-  assert.ok((await adminBets()).every((b) => b.status === 'void'));
-  await assert.rejects(A.voidMarket('m1'), /already/i);
-});
-
-it('pool market with nobody on the winner is voided', async () => {
-  const A = await client(); const B = await client();
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await B.signUp('bob', 'secret1');
-  await B.placeBet('m1', 'o2', 70);
-  await A.resolveMarket('m1', 'o1');
-  assert.equal((await adminMarket('m1')).status, 'void');
-  assert.equal((await adminUser('bob')).balance, 500);
-});
-
-it('ensureMarkets is idempotent, never overwrites, and racing clients are fine', async () => {
-  const A = await client(); const B = await client();
-  await A.signUp('alice', 'secret1');
-  await B.signUp('bob', 'secret1');
-  const m = autoTimerMarket(clock.t);
-  const m2 = { ...autoTimerMarket(clock.t + 5), id: 'auto-2026-01-10-other' };
-  await Promise.all([A.ensureMarkets([m, m2]), B.ensureMarkets([{ ...m, openedAt: clock.t + 99 }, m2])]);
-  const all = await adminList('markets');
-  assert.equal(all.length, 2);
-  await A.placeBet(m.id, 'd1', 25);
-  await B.ensureMarkets([m]);
-  await A.ensureMarkets([m, m2]);
-  const stored = await adminMarket(m.id);
-  assert.equal(stored.totalPool, 25);
-  assert.equal(stored.betCount, 1);
-  assert.ok(stored.openedAt === clock.t || stored.openedAt === clock.t + 99);
-});
-
-it('unauthenticated store calls fail cleanly', async () => {
-  const s = await client();
-  await assert.rejects(s.placeBet('m1', 'o1', 5), /logged in/i);
-  await assert.rejects(s.ensureMarkets([autoTimerMarket(clock.t)]), /logged in/i);
-  await assert.rejects(s.resolveMarket('m1', 'o1'), /logged in/i);
-  await s.autoResolveExpired(); // no-op
-  await s.markBrokeIfNeeded(); // no-op
-});
-
-it('any user can resolve an auto timer market by reporting eventAt', async () => {
-  const A = await client(); const B = await client();
-  const m = autoTimerMarket(clock.t);
-  await A.signUp('alice', 'secret1');
-  await A.ensureMarkets([m]);
-  await A.placeBet(m.id, 'd4', 100);
-  await B.signUp('bob', 'secret1');
-  clock.t += 2 * DAY_MS;
-  await assert.rejects(B.resolveMarket(m.id, null, clock.t + HOUR_MS), /future/i);
-  await B.resolveMarket(m.id, null, T0 + 2 * DAY_MS - HOUR_MS);
-  const r = await adminMarket(m.id);
-  assert.equal(r.status, 'resolved');
-  assert.equal(r.resolvedOptionId, 'd4');
-  assert.equal(r.eventAt, T0 + 2 * DAY_MS - HOUR_MS);
-  assert.equal(r.resolvedBy, 'bob');
-  assert.equal((await adminUser('alice')).balance, 400 + 300);
-  const bets = await adminBets(m.id);
-  assert.equal(bets[0].status, 'won');
-});
-
-it('autoResolveExpired resolves expired timer market; concurrent clients do not double-pay', async () => {
-  const A = await client(); const B = await client(); const C = await client();
-  const m = autoTimerMarket(clock.t);
-  await A.signUp('alice', 'secret1');
-  await A.ensureMarkets([m]);
-  await A.placeBet(m.id, 'never', 100);
-  await B.signUp('bob', 'secret1');
-  await B.placeBet(m.id, 'd1', 100);
-  await C.signUp('carol', 'secret1');
-
-  clock.t += 3 * DAY_MS;
-  await C.autoResolveExpired();
-  assert.equal((await adminMarket(m.id)).status, 'open');
-
-  clock.t += 6 * DAY_MS;
-  await Promise.all([A.autoResolveExpired(), B.autoResolveExpired(), C.autoResolveExpired()]);
-  const r = await adminMarket(m.id);
-  assert.equal(r.status, 'resolved');
-  assert.equal(r.resolvedOptionId, 'never');
-  assert.equal(r.resolvedBy, 'auto');
-  assert.equal((await adminUser('alice')).balance, 400 + 130);
-  assert.equal((await adminUser('alice')).totalWon, 130);
-  assert.equal((await adminUser('bob')).balance, 400);
-  await A.autoResolveExpired();
-  assert.equal((await adminUser('alice')).balance, 530);
-});
-
-it('double resolve race: exactly one wins, payout once', async () => {
-  const A = await client(); const B = await client(); const C = await client();
-  const m = autoTimerMarket(clock.t);
-  await A.signUp('alice', 'secret1');
-  await A.ensureMarkets([m]);
-  await A.placeBet(m.id, 'd1', 100);
-  await B.signUp('bob', 'secret1');
-  await B.placeBet(m.id, 'd4', 100);
-  await C.signUp('carol', 'secret1');
-  clock.t += HOUR_MS;
-  const results = await Promise.allSettled([
-    A.resolveMarket(m.id, 'd1'), B.resolveMarket(m.id, 'd4'), C.resolveMarket(m.id, 'd1'),
-  ]);
-  const ok = results.filter((r) => r.status === 'fulfilled');
-  assert.equal(ok.length, 1, JSON.stringify(results.map((r) => r.status + ':' + (r.reason && r.reason.message))));
-  for (const r of results.filter((x) => x.status === 'rejected')) assert.match(r.reason.message, /already/i);
-  const total = (await adminUser('alice')).balance + (await adminUser('bob')).balance;
-  // either d1 (alice +600) or d4 (bob +300)
-  assert.ok(total === 400 + 400 + 600 || total === 400 + 400 + 300, 'total=' + total);
-});
-
-it('concurrent bets from many clients stay consistent', async () => {
-  const names = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'].map((x) => x + 'aaa');
-  const A = await client();
-  const owner = await A.signUp('owner', 'secret1');
-  await A.createMarket(customMarket(owner, clock.t));
-  const cs = [];
-  for (const nm of names) { const c = await client(); await c.signUp(nm, 'secret1'); cs.push(c); }
-  const rs = await Promise.all(cs.map((c, i) => c.placeBet('m1', i % 2 ? 'o2' : 'o1', 10 * (i + 1))));
-  assert.equal(rs.length, 6);
-  const m = await adminMarket('m1');
-  assert.equal(m.betCount, 6);
-  assert.equal(m.totalPool, 210);
-  assert.equal(m.optionTotals.o1, 10 + 30 + 50);
-  assert.equal(m.optionTotals.o2, 20 + 40 + 60);
-  assert.equal((await adminBets('m1')).length, 6);
-  // same user double-spend: 3 parallel 200 bets from a 500 balance -> only 2 succeed
-  const u = cs[0];
-  const rr = await Promise.allSettled([u.placeBet('m1', 'o1', 200), u.placeBet('m1', 'o1', 200), u.placeBet('m1', 'o1', 200)]);
-  assert.equal(rr.filter((r) => r.status === 'fulfilled').length, 2);
-});
-
-it('bet racing with resolve: everything ends consistent (no lost stake)', async () => {
-  const A = await client(); const B = await client(); const C = await client();
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await B.signUp('bob', 'secret1');
-  await C.signUp('carol', 'secret1');
-  await B.placeBet('m1', 'o1', 50);
-  const rs = await Promise.allSettled([A.resolveMarket('m1', 'o1'), C.placeBet('m1', 'o1', 100), C.placeBet('m1', 'o2', 30)]);
-  assert.equal(rs[0].status, 'fulfilled');
-  const m = await adminMarket('m1');
-  assert.equal(m.status, 'resolved');
-  const bets = await adminBets('m1');
-  for (const b of bets) assert.notEqual(b.status, 'open', 'no bet may remain open on a settled market');
-  // conservation: sum(balances) = 1500 (3 users x 500) after all settled
-  const total = (await adminList('users')).reduce((s, u) => s + u.balance, 0);
-  assert.equal(total, 1500);
-});
-
-it('username uniqueness race (sign-up)', async () => {
-  const cs = [await client(), await client(), await client()];
-  const rs = await Promise.allSettled([
-    cs[0].signUp('Racer', 'secret1'), cs[1].signUp('racer', 'secret2'), cs[2].signUp('RACER', 'secret3'),
-  ]);
-  const ok = rs.filter((r) => r.status === 'fulfilled');
-  assert.equal(ok.length, 1);
-  for (const r of rs.filter((x) => x.status === 'rejected')) assert.match(r.reason.message, /taken/i);
-  const users = await adminList('users');
-  assert.equal(users.length, 1);
-  assert.equal((await adminList('usernames')).length, 1);
-  // losers hold no session
-  for (let i = 0; i < 3; i++) if (rs[i].status === 'rejected') assert.equal(await currentUser(cs[i]), null);
-});
-
-it('broke flow: brokeSince, claim rejected same day, allowed next day, penalty tax applies', async () => {
-  const s = await client(); const B = await client();
-  const m = autoTimerMarket(clock.t);
-  await s.signUp('alice', 'secret1');
-  await s.ensureMarkets([m]);
-  await s.placeBet(m.id, 'd1', 500);
-  await s.markBrokeIfNeeded();
-  assert.equal((await adminUser('alice')).brokeSince, null);
-  await assert.rejects(s.claimRestart());
-
-  clock.t += 5 * DAY_MS;
-  await B.signUp('bob', 'secret1');
-  await B.resolveMarket(m.id, null, clock.t); // someone else settles alice's loss
-  assert.equal((await adminUser('alice')).balance, 0);
-
-  await s.markBrokeIfNeeded();
-  assert.equal((await adminUser('alice')).brokeSince, economy.dayKey(clock.t));
-  await assert.rejects(s.claimRestart(), /tomorrow/i);
-
-  clock.t += 36 * HOUR_MS;
-  await s.claimRestart();
-  const u = await adminUser('alice');
-  assert.equal(u.balance, 100);
-  assert.equal(u.bankruptcies, 1);
-  assert.equal(u.brokeSince, null);
-  assert.equal(u.penaltyUntil, clock.t + 3 * DAY_MS);
-  await assert.rejects(s.claimRestart());
-
-  const m2 = autoTimerMarket(clock.t, 'auto-2026-01-16-test');
-  await s.ensureMarkets([m2]);
-  await s.placeBet(m2.id, 'd1', 100);
-  clock.t += HOUR_MS;
-  await B.resolveMarket(m2.id, null, clock.t);
-  assert.equal((await adminUser('alice')).balance, 475);
-  const won = (await adminBets(m2.id))[0];
-  assert.equal(won.status, 'won');
-  assert.equal(won.taxed, 125);
-  assert.equal(won.payout, 475);
-});
-
-it('sign-out: onAuthChange gets null, listeners unsubscribed, no uncaught errors afterwards', async () => {
-  const errs = [];
-  const orig = console.error; console.error = (...a) => errs.push(a);
-  const s = await client();
-  await s.signUp('alice', 'secret1');
-  const got = { users: 0, markets: 0, bets: 0 };
-  const offs = ['users', 'markets', 'bets'].map((k) => s['subscribe' + k[0].toUpperCase() + k.slice(1)](() => { got[k]++; }));
-  await until(() => got.users && got.markets && got.bets);
-  const { seen, off } = collect(s);
-  await s.signOut();   // do NOT unsubscribe first: simulates the window before app.js endSession()
-  await until(() => seen.includes(null));
-  offs.forEach((o) => o());
-  off();
-  await new Promise((r) => setTimeout(r, 500));
-  console.error = orig;
-  assert.deepEqual(errs.map((e) => String(e[0])), []);
-});
-
-it('profile self-repair when users doc is missing (interrupted sign-up)', async () => {
-  const s = await client();
-  const alice = await s.signUp('Alice', 'secret1');
-  await s.signOut();
-  // admin deletes profile doc but leaves usernames + auth
-  await fetch(`${REST}/users/${alice.uid}`, { method: 'DELETE', headers: { Authorization: 'Bearer owner' } });
-  const u = await s.signIn('alice', 'secret1');
-  assert.equal(u.username, 'Alice');
-  assert.equal(u.balance, 500);
-  assert.equal((await adminUser('Alice')).uid, alice.uid);
-});
-
-it('stale bet-id query (bet lands between query and transaction) is retried, late bet is settled', async () => {
-  let hook = null;
-  const wrapped = { ...fbFs, getDocs: async (q, ...r) => { const res = await fbFs.getDocs(q, ...r); if (hook) { const h = hook; hook = null; await h(); } return res; } };
-  const A = await createFirebaseStore(config, { sdk: { ...sdk, firestore: wrapped }, emulator, appName: 'stale' + ++n, now: () => clock.t });
-  clients.push(A);
-  const B = await client();
-  const alice = await A.signUp('alice', 'secret1');
-  await A.createMarket(customMarket(alice, clock.t));
-  await B.signUp('bob', 'secret1');
-  await A.placeBet('m1', 'o1', 10);
-  hook = () => B.placeBet('m1', 'o2', 40);
-  await A.resolveMarket('m1', 'o2');
-  assert.equal(hook, null, 'hook must have run');
-  const bets = await adminBets('m1');
-  assert.equal(bets.length, 2);
-  assert.ok(bets.every((b) => b.status !== 'open'));
-  assert.equal((await adminUser('bob')).balance, 500 - 40 + 50);
-  assert.equal((await adminUser('alice')).balance, 490);
-});
-
-// ---------------------------------------------------------------- firestore.rules
-const RT0 = Date.UTC(2026, 0, 10, 12);
-
-async function raw(email) {
-  const app = fbApp.initializeApp(config, 'raw' + ++n);
-  const auth = fbAuth.getAuth(app); fbAuth.connectAuthEmulator(auth, emulator.authUrl, { disableWarnings: true });
-  const db = F.getFirestore(app); F.connectFirestoreEmulator(db, FS_H, Number(FS_P));
-  let uid = null;
-  if (email) { const c = await fbAuth.createUserWithEmailAndPassword(auth, email, 'secret1'); uid = c.user.uid; }
-  return { db, uid, auth };
-}
-const denied = (p) => assert.rejects(p, (e) => e.code === 'permission-denied');
-const R = (db, path) => F.doc(db, ...path.split('/'));
-
-async function seed() {
-  // Real users through the real store: alice (owner of custom market m1), bob (has a bet).
-  const mk = async (name) => {
-    const s = await createFirebaseStore(config, { sdk, emulator, appName: 's' + ++n, now: () => RT0 });
-    const u = await s.signUp(name, 'secret1');
-    return { s, u };
-  };
-  const alice = await mk('alice'); const bob = await mk('bob');
-  const m = economy.buildCustomMarket({ id: 'm1', user: alice.u, now: RT0, title: 'Will it rain?', description: '', kind: 'choice', optionLabels: ['Y', 'N'], closesAt: RT0 + 86400000 });
+it('choice market, unchallenged report: bets, cooldown, finalize after the window, claims (winner, loser), bond claim', async () => {
+  await openGame();
+  const alice = await join('alice'); const bob = await join('bob'); const carol = await join('carol');
+  const m = choiceMarket(alice, 'm1', { closeInMs: 4500 });
   await alice.s.createMarket(m);
-  const auto = { ...economy.buildCustomMarket({ id: 'auto-x', user: { uid: 'house', username: 'h' }, now: RT0, title: 'How long?', description: '', kind: 'timer' }), type: 'auto', createdBy: 'house', createdByName: 'The House' };
-  await alice.s.ensureMarkets([auto]);
-  const bet = await bob.s.placeBet('m1', 'o1', 50);
-  return { alice, bob, bet };
-}
+  assert.equal((await player(alice.uid)).marketsCount, 1);
+  assert.equal((await player(alice.uid)).marketsDay, economy.utcDayNumber(Date.now()));
+  await assert.rejects(alice.s.createMarket(m), /already exists/);
 
-it('unauthenticated: no reads, writes, deletes', async () => {
-  const { alice, bet } = await seed();
-  const { db } = await raw(null);
-  await denied(F.getDoc(R(db, `users/${alice.u.uid}`)));
-  await denied(F.getDocs(F.collection(db, 'markets')));
-  await denied(F.getDocs(F.collection(db, 'bets')));
-  await denied(F.getDoc(R(db, 'usernames/alice')));
-  await denied(F.setDoc(R(db, 'markets/zzz'), { id: 'zzz' }));
-  await denied(F.updateDoc(R(db, `users/${alice.u.uid}`), { balance: 99999 }));
-  await denied(F.deleteDoc(R(db, `bets/${bet.id}`)));
-  await denied(F.deleteDoc(R(db, 'markets/m1')));
-  // REST without a token
-  const r = await fetch(`http://${EMU_HOST}/v1/projects/${PROJECT}/databases/(default)/documents/users`);
-  assert.equal(r.status, 403);
+  const b1 = await bob.s.placeBet('m1', 'o1', 200);
+  const b2 = await carol.s.placeBet('m1', 'o2', 100);
+  await assert.rejects(bob.s.placeBet('m1', 'o1', 10), /Slow down/);
+  await assert.rejects(bob.s.placeBet('m1', 'o1', 5000), /Not enough/);
+  await assert.rejects(bob.s.placeBet('nope', 'o1', 5), /not found/i);
+  await sleep(economy.BET_COOLDOWN_MS + 100);
+  const b3 = await bob.s.placeBet('m1', 'o1', 50);
+  let mk = await market('m1');
+  assert.deepEqual(mk.optionTotals, { o1: 250, o2: 100 });
+  assert.equal(mk.totalPool, 350);
+  assert.equal(mk.betCount, 3);
+  assert.equal(mk.lastBetId, b3.id);
+  const stake = await adminGet('stakes', `m1_${bob.uid}`);
+  assert.equal(stake.amount, 250);
+  const pb = await player(bob.uid);
+  assert.equal(pb.balance, 250); assert.equal(pb.openStake, 250); assert.equal(pb.totalWagered, 250);
+  assert.equal(pb.lastBetId, b3.id);
+  await assert.rejects(alice.s.reportResult('m1', 'o1'), /too early/i);
+  await assert.rejects(bob.s.claimBet(b1.id), /not been settled/);
+
+  await waitUntil(m.closesAt);
+  await assert.rejects(bob.s.placeBet('m1', 'o1', 10), /closed/i);
+  await assert.rejects(bob.s.reportResult('m1', 'o1'), /Only the creator/);
+  await alice.s.reportResult('m1', 'o1', null, 'https://example.com/proof');
+  mk = await market('m1');
+  assert.equal(mk.status, 'reported'); assert.equal(mk.reportedBy, alice.uid); assert.equal(mk.reportedByName, 'alice');
+  assert.equal(mk.evidence, 'https://example.com/proof');
+  assert.equal((await player(alice.uid)).balance, 480);
+  assert.equal((await player(alice.uid)).lastBondMarketId, 'm1');
+  await assert.rejects(bob.s.placeBet('m1', 'o1', 10), /closed|reported/i);
+  await assert.rejects(alice.s.challengeReport('m1'), /your own report/);
+  // the store thinks it can finalize (decisionNow is 26h ahead) but the rules know the window is still open
+  await assert.rejects(carol.s.finalizeMarket('m1'), /rules rejected/);
+
+  await waitUntil(mk.reportedAt + TEST_CHALLENGE_WINDOW_MS);
+  const fin = await carol.s.finalizeMarket('m1');
+  assert.equal(fin.status, 'resolved'); assert.equal(fin.resolvedOptionId, 'o1');
+  assert.equal((await bob.s.finalizeMarket('m1')).status, 'resolved', 'idempotent');
+
+  // pool payout: floor(amount * totalPool / optionTotals[o1]) = floor(200*350/250) = 280 and floor(50*350/250) = 70
+  const c1 = await bob.s.claimBet(b1.id);
+  assert.deepEqual([c1.status, c1.payout, c1.taxed], ['won', 280, 0]);
+  const c3 = await bob.s.claimBet(b3.id);
+  assert.deepEqual([c3.status, c3.payout], ['won', 70]);
+  const c2 = await carol.s.claimBet(b2.id);
+  assert.deepEqual([c2.status, c2.payout], ['lost', 0]);
+  await assert.rejects(bob.s.claimBet(b1.id), /already been claimed/);
+  await assert.rejects(carol.s.claimBet(b1.id), /not your bet/);
+  const pb2 = await player(bob.uid);
+  assert.equal(pb2.balance, 250 + 350); assert.equal(pb2.openStake, 0); assert.equal(pb2.totalWon, 350);
+  assert.equal(pb2.lastClaimId, b3.id);
+  const pc = await player(carol.uid);
+  assert.equal(pc.balance, 400); assert.equal(pc.openStake, 0);
+  assert.equal((await bet(b1.id)).status, 'won');
+
+  assert.equal(await alice.s.claimBond('m1'), 20);
+  await assert.rejects(alice.s.claimBond('m1'), /already been paid/);
+  await assert.rejects(bob.s.claimBond('m1'), /didn't put up a bond/);
+  assert.equal((await player(alice.uid)).balance, 500);
+  const total = (await adminList('players')).reduce((a, p) => a + p.balance + p.openStake, 0);
+  assert.equal(total, 4 * 500, 'no money created or destroyed (pool market)');
 });
 
-it('authenticated: deletes denied everywhere', async () => {
-  const { alice, bob, bet } = await seed();
-  const { db } = await raw('mal@users.sonnetous.app');
-  await denied(F.deleteDoc(R(db, `users/${bob.u.uid}`)));
-  await denied(F.deleteDoc(R(db, `bets/${bet.id}`)));
-  await denied(F.deleteDoc(R(db, 'markets/m1')));
-  await denied(F.deleteDoc(R(db, 'usernames/alice')));
-  // even owner-ish deletions by the actual owners
-  await denied(F.deleteDoc(R(alice.s && db, `users/${alice.u.uid}`)));
+it('disputes: uphold / overturn / tie / no votes, bond claims both ways, voter rules', async () => {
+  await openGame();
+  const alice = await join('alice'); const frank = await join('frank');
+  const bettors = { A: await join('bob'), B: await join('carol'), C: await join('dave'), D: await join('erin') };
+  const gina = await join('gina'); const hank = await join('hank');
+  const closesAt = Date.now() + 6000;
+  const ids = ['A', 'B', 'C', 'D'].map((k) => `d${k}`);
+  for (const id of ids) {
+    await alice.s.createMarket(economy.buildCustomMarket({
+      id, player: { uid: alice.uid, username: 'alice' }, now: Date.now(), title: `Dispute ${id}?`, description: '',
+      kind: 'choice', optionLabels: ['Yes', 'No'], closesAt,
+    }));
+  }
+  assert.equal((await player(alice.uid)).marketsCount, 4);
+  for (const k of ['A', 'B', 'C', 'D']) await bettors[k].s.placeBet(`d${k}`, 'o1', 100);
+  await waitUntil(closesAt);
+  const plan = {
+    dA: { votes: [[gina, true]], status: 'resolved', rep: 40, chal: 0 },
+    dB: { votes: [[gina, false]], status: 'void', rep: 0, chal: 40 },
+    dC: { votes: [[gina, true], [hank, false]], status: 'void', rep: 20, chal: 20 },
+    dD: { votes: [], status: 'void', rep: 20, chal: 20 },
+  };
+  let lastChallenge = 0;
+  for (const id of ids) {
+    await alice.s.reportResult(id, 'o1');
+    await assert.rejects(alice.s.challengeReport(id), /your own report/);
+    await frank.s.challengeReport(id);
+    lastChallenge = (await market(id)).challengedAt;
+    assert.equal((await market(id)).status, 'challenged');
+    const k = id.slice(1);
+    // the bettor, the reporter and the challenger may not vote; the others once
+    await assert.rejects(bettors[k].s.voteOnDispute(id, true), /bet on this market/);
+    await assert.rejects(alice.s.voteOnDispute(id, true), /part of this dispute/);
+    await assert.rejects(frank.s.voteOnDispute(id, false), /part of this dispute/);
+    for (const [who, up] of plan[id].votes) {
+      await who.s.voteOnDispute(id, up);
+      await assert.rejects(who.s.voteOnDispute(id, up), /already voted/);
+    }
+    const mk = await market(id);
+    assert.equal(mk.votesUphold, plan[id].votes.filter((v) => v[1]).length);
+    assert.equal(mk.votesOverturn, plan[id].votes.filter((v) => !v[1]).length);
+    if (plan[id].votes.length) assert.equal(mk.lastVoteId, `${id}_${plan[id].votes.at(-1)[0].uid}`);
+    await assert.rejects(frank.s.finalizeMarket(id), /rules rejected/, 'voting window still open');
+  }
+  assert.deepEqual((await first(gina.s, 'subscribeMyVotes', (l) => l.length === 3)).sort(), ['dA', 'dB', 'dC']);
+  assert.deepEqual(await first(hank.s, 'subscribeMyVotes', (l) => l.length === 1), ['dC']);
+  await waitUntil(lastChallenge + TEST_VOTE_WINDOW_MS);
+  for (const id of ids) {
+    const fin = await hank.s.finalizeMarket(id);
+    assert.equal(fin.status, plan[id].status, id);
+    assert.equal(fin.resolvedOptionId, plan[id].status === 'resolved' ? 'o1' : null);
+  }
+  // bettors: dA wins (pool of 100 all on o1 -> 100 back), the others are voided (refund)
+  const c = await bettors.A.s.claimBet((await adminList('bets2')).find((b) => b.marketId === 'dA')._id);
+  assert.deepEqual([c.status, c.payout], ['won', 100]);
+  for (const k of ['B', 'C', 'D']) {
+    const b = (await adminList('bets2')).find((x) => x.marketId === `d${k}`);
+    const r = await bettors[k].s.claimBet(b._id);
+    assert.deepEqual([r.status, r.payout], ['void', 100]);
+    assert.equal((await player(bettors[k].uid)).balance, 500);
+  }
+  // bonds: both ways; the loser's claim pays 0 but still marks the bond as paid
+  const paid = {};
+  for (const id of ids) {
+    paid[id] = [await alice.s.claimBond(id), await frank.s.claimBond(id)];
+    assert.deepEqual(paid[id], [plan[id].rep, plan[id].chal], id);
+    const mk = await market(id);
+    assert.equal(mk.reporterBondPaid, true); assert.equal(mk.challengerBondPaid, true);
+  }
+  assert.equal((await player(alice.uid)).balance, 500);
+  assert.equal((await player(frank.uid)).balance, 500);
+  await assert.rejects(alice.s.claimBond('dA'), /already been paid/);
+  const total = (await adminList('players')).reduce((a, p) => a + p.balance + p.openStake, 0);
+  assert.equal(total, 9 * 500, 'admin + 8 players');
 });
 
-it('user create rules / usernames immutable', async () => {
-  const { alice } = await seed();
-  const { db, uid } = await raw('mal@users.sonnetous.app');
-  const base = { uid, username: 'mal', balance: 500, createdAt: RT0, bankruptcies: 0, brokeSince: null, penaltyUntil: null, totalWagered: 0, totalWon: 0 };
-  // profile without a claimed username
-  await denied(F.setDoc(R(db, `users/${uid}`), base));
-  // claim + rich profile in one batch
-  let b = F.writeBatch(db); b.set(R(db, 'usernames/mal'), { uid }); b.set(R(db, `users/${uid}`), { ...base, balance: 1000 });
-  await denied(b.commit());
-  // profile for someone else's uid
-  b = F.writeBatch(db); b.set(R(db, 'usernames/mal'), { uid }); b.set(R(db, `users/${alice.u.uid}`), base);
-  await denied(b.commit());
-  // stealing a name: claim alice for my uid, or claim mal for alice's uid
-  await denied(F.setDoc(R(db, 'usernames/alice'), { uid }));
-  await denied(F.setDoc(R(db, 'usernames/mal'), { uid: alice.u.uid }));
-  await denied(F.setDoc(R(db, 'usernames/Bad-Name'), { uid }));
-  await denied(F.setDoc(R(db, 'usernames/mal'), { uid, extra: 1 }));
-  // profile claiming a name that another uid owns
-  b = F.writeBatch(db); b.set(R(db, `users/${uid}`), { ...base, username: 'alice' });
-  await denied(b.commit());
-  // the legit one works
-  b = F.writeBatch(db); b.set(R(db, 'usernames/mal'), { uid }); b.set(R(db, `users/${uid}`), base);
-  await b.commit();
-  // usernames immutable now
-  await denied(F.setDoc(R(db, 'usernames/mal'), { uid }));
-  await denied(F.updateDoc(R(db, 'usernames/mal'), { uid: alice.u.uid }));
+it('pool market whose reported option has no money is voided; reporter gets the bond back', async () => {
+  await openGame();
+  const alice = await join('alice'); const bob = await join('bob'); const carol = await join('carol');
+  const m = choiceMarket(alice, 'z1', { closeInMs: 3500 });
+  await alice.s.createMarket(m);
+  const bb = await bob.s.placeBet('z1', 'o2', 100);
+  const cb = await carol.s.placeBet('z1', 'o2', 50);
+  await waitUntil(m.closesAt);
+  await alice.s.reportResult('z1', 'o1');
+  await waitUntil((await market('z1')).reportedAt + TEST_CHALLENGE_WINDOW_MS);
+  const fin = await bob.s.finalizeMarket('z1');
+  assert.equal(fin.status, 'void'); assert.equal(fin.resolvedOptionId, null);
+  assert.equal((await bob.s.claimBet(bb.id)).payout, 100);
+  assert.equal((await carol.s.claimBet(cb.id)).status, 'void');
+  assert.equal(await alice.s.claimBond('z1'), 20);
+  assert.equal((await player(bob.uid)).balance, 500);
+  assert.equal((await player(alice.uid)).balance, 500);
 });
 
-it('user updates: identity fixed; others only balance/totalWon; ints >= 0', async () => {
-  const { alice, bob } = await seed();
-  const { db, uid } = await raw('mal@users.sonnetous.app');
-  const base = { uid, username: 'mal', balance: 500, createdAt: RT0, bankruptcies: 0, brokeSince: null, penaltyUntil: null, totalWagered: 0, totalWon: 0 };
-  const b = F.writeBatch(db); b.set(R(db, 'usernames/mal'), { uid }); b.set(R(db, `users/${uid}`), base); await b.commit();
-  const bobRef = R(db, `users/${bob.u.uid}`);
-  await denied(F.updateDoc(bobRef, { username: 'hacked' }));
-  await denied(F.updateDoc(bobRef, { uid: 'x' }));
-  await denied(F.updateDoc(bobRef, { createdAt: 1 }));
-  await denied(F.updateDoc(bobRef, { bankruptcies: 9 }));
-  await denied(F.updateDoc(bobRef, { balance: -1 }));
-  await denied(F.updateDoc(bobRef, { balance: 10.5 }));
-  await denied(F.updateDoc(bobRef, { balance: 5, extraField: 1 }));
-  await F.updateDoc(bobRef, { balance: 777, totalWon: 3 }); // settlement-style write is allowed
-  // own doc
-  const me = R(db, `users/${uid}`);
-  await denied(F.updateDoc(me, { username: 'x' }));
-  await F.updateDoc(me, { balance: 400, totalWagered: 100, brokeSince: '2026-01-10' });
+it('creator can void an empty market (and only an empty one); daily market cap', async () => {
+  await openGame();
+  const alice = await join('alice'); const bob = await join('bob');
+  for (let i = 1; i <= 5; i++) await alice.s.createMarket(choiceMarket(alice, `c${i}`, { closeInMs: 60000 }));
+  await assert.rejects(alice.s.createMarket(choiceMarket(alice, 'c6', { closeInMs: 60000 })), /5 markets per day/);
+  assert.equal((await player(alice.uid)).marketsCount, 5);
+  await assert.rejects(bob.s.voidMarket('c1'), /Only the creator/);
+  await bob.s.placeBet('c2', 'o1', 10);
+  await assert.rejects(alice.s.voidMarket('c2'), /Bets have been placed/);
+  await alice.s.voidMarket('c1');
+  const mk = await market('c1');
+  assert.equal(mk.status, 'void');
+  assert.equal(await alice.s.voidMarket('c1').then(() => 'ok', (e) => e.message.replace(/\.$/, '')), 'This market can no longer be voided');
+  assert.equal((await bob.s.finalizeMarket('c1')).status, 'void');
+  await assert.rejects(bob.s.placeBet('c1', 'o1', 10), /voided/);
 });
 
-it('bets: create as self only, open+unpaid; settle once; only status/payout/taxed', async () => {
-  const { alice, bob, bet } = await seed();
-  const { db, uid } = await raw('mal@users.sonnetous.app');
-  const mk = (over) => ({ ...bet, id: 'b-x', uid, amount: 5, status: 'open', payout: 0, ...over });
-  await denied(F.setDoc(R(db, 'bets/b-x'), mk({ uid: bob.u.uid })));
-  await denied(F.setDoc(R(db, 'bets/b-x'), mk({ status: 'won', payout: 100 })));
-  await denied(F.setDoc(R(db, 'bets/b-x'), mk({ payout: 100 })));
-  await denied(F.setDoc(R(db, 'bets/b-x'), mk({ amount: -5 })));
-  await denied(F.setDoc(R(db, 'bets/b-x'), mk({ amount: 1.5 })));
-  await denied(F.setDoc(R(db, 'bets/other-id'), mk({ id: 'b-x' })));
-  await F.setDoc(R(db, 'bets/b-x'), mk({}));
-  const bref = R(db, `bets/${bet.id}`);
-  await denied(F.updateDoc(bref, { amount: 1 }));
-  await denied(F.updateDoc(bref, { uid }));
-  await denied(F.updateDoc(bref, { status: 'open', payout: 5 }));      // not a real transition
-  await denied(F.updateDoc(bref, { status: 'weird' }));
-  await F.updateDoc(bref, { status: 'won', payout: 100, taxed: 0 });
-  await denied(F.updateDoc(bref, { status: 'lost', payout: 0, taxed: 0 })); // second settlement
+it('timer markets: per-bet windows (event before the bet voids it), report -> finalize, and expiry auto-finalize via housekeeping', async () => {
+  await openGame();
+  const eve = await join('eve');
+  const [carol, dave, frank, gina, hank] = [await join('carol'), await join('dave'), await join('frank'), await join('gina'), await join('hank')];
+  const h1 = houseTimer('t1', { closeInMs: 4000 });
+  const h2 = houseTimer('t2', { closeInMs: 1500 });
+  await ADMIN.ensureHouseMarkets([h1, h2]);
+  await ADMIN.ensureHouseMarkets([h1]); // idempotent
+  assert.equal((await adminList('markets2')).length, 2);
+  const id1 = h1.id; const id2 = h2.id;
+
+  // expiry market: nobody reports
+  const g2 = await gina.s.placeBet(id2, 'quick', 100);
+  const hk2 = await hank.s.placeBet(id2, 'never', 100);
+  // event market: carol bets before the event, dave after it, frank bets 'never' before it
+  const c1 = await carol.s.placeBet(id1, 'quick', 100);
+  const f1 = await frank.s.placeBet(id1, 'never', 100);
+  await sleep(300);
+  const eventAt = Date.now();
+  await sleep(50);
+  const d1 = await dave.s.placeBet(id1, 'quick', 100);
+  assert.ok(d1.placedAt > eventAt);
+  // eventAt in the future / before the market opened are refused by the store, and by the rules (attack test)
+  await assert.rejects(eve.s.reportResult(id1, null, Date.now() + 60000), /future/);
+  await assert.rejects(eve.s.reportResult(id1, null, h1.openedAt - 1000), /before the market opened/);
+  await eve.s.reportResult(id1, null, eventAt, 'https://example.com/e');
+  const rep = await market(id1);
+  assert.equal(rep.status, 'reported'); assert.equal(rep.reportedOptionId, null); assert.equal(rep.reportedEventAt, eventAt);
+
+  // the expiry market: finalize by housekeeping of a client that has nothing to do with it
+  await waitUntil(h2.expiresAt);
+  const hkResult = await eve.s.runHousekeeping();
+  assert.ok(hkResult.finalized >= 1, 'housekeeping finalized the expired timer');
+  const m2 = await market(id2);
+  assert.equal(m2.status, 'resolved'); assert.equal(m2.resolvedOptionId, 'never'); assert.equal(m2.eventAt, null);
+  assert.equal((await gina.s.runHousekeeping()).claimed, 1, 'housekeeping claims my settled bets');
+  assert.equal((await hank.s.runHousekeeping()).claimed, 1);
+  assert.equal((await bet(g2.id)).status, 'lost');
+  assert.equal((await bet(hk2.id)).status, 'won'); assert.equal((await bet(hk2.id)).payout, 150);
+  assert.equal((await player(hank.uid)).balance, 550);
+  assert.equal((await player(gina.uid)).balance, 400);
+
+  // the reported market: finalize after the challenge window
+  await waitUntil(rep.reportedAt + TEST_CHALLENGE_WINDOW_MS);
+  const fin = await dave.s.finalizeMarket(id1);
+  assert.equal(fin.status, 'resolved'); assert.equal(fin.resolvedOptionId, null); assert.equal(fin.eventAt, eventAt);
+  const rc = await carol.s.claimBet(c1.id);
+  assert.deepEqual([rc.status, rc.payout], ['won', 300]);
+  const rd = await dave.s.claimBet(d1.id);
+  assert.deepEqual([rd.status, rd.payout], ['void', 100], 'bet placed after the event is refunded');
+  const rf = await frank.s.claimBet(f1.id);
+  assert.deepEqual([rf.status, rf.payout], ['lost', 0]);
+  await eve.s.runHousekeeping(); // pays her bond back (if her earlier housekeeping run has not already)
+  await assert.rejects(eve.s.claimBond(id1), /already been paid/);
+  assert.equal((await player(eve.uid)).balance, 500);
+  assert.equal((await player(dave.uid)).balance, 500);
 });
 
-it('markets: create rules; update restricted to totals/result while open; creator-only status for custom', async () => {
-  const { alice, bob } = await seed();
-  const { db, uid } = await raw('mal@users.sonnetous.app');
-  const good = economy.buildCustomMarket({ id: 'mm', user: { uid, username: 'mal' }, now: RT0, title: 'Mal market', description: '', kind: 'choice', optionLabels: ['a', 'b'], closesAt: RT0 + 1e6 });
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, createdBy: alice.u.uid }));
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, totalPool: 5 }));
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, betCount: 1 }));
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, status: 'resolved' }));
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, createdBy: 'house' }));
-  await denied(F.setDoc(R(db, 'markets/mm'), { ...good, type: 'auto' }));
-  await denied(F.setDoc(R(db, 'markets/other'), good));
-  await F.setDoc(R(db, 'markets/mm'), good);
-  // overwrite existing (create on existing = update)
-  await denied(F.setDoc(R(db, 'markets/m1'), { ...good, id: 'm1' }));
-  // mal touching alice's market
-  const m1 = R(db, 'markets/m1');
-  await denied(F.updateDoc(m1, { options: [] }));
-  await denied(F.updateDoc(m1, { closesAt: 1 }));
-  await denied(F.updateDoc(m1, { createdBy: uid }));
-  await denied(F.updateDoc(m1, { status: 'resolved', resolvedOptionId: 'o2', resolvedAt: 1, resolvedBy: 'mal', eventAt: null }));
-  await F.updateDoc(m1, { totalPool: 60, betCount: 2, optionTotals: { o1: 50, o2: 10 } }); // bet-style
-  // auto market: anyone may resolve
-  await F.updateDoc(R(db, 'markets/auto-x'), { status: 'resolved', resolvedOptionId: 'd1', resolvedAt: 1, resolvedBy: 'mal', eventAt: null });
-  await denied(F.updateDoc(R(db, 'markets/auto-x'), { status: 'open' }));
-  await denied(F.updateDoc(R(db, 'markets/auto-x'), { totalPool: 5 }));
+it('bankruptcy: markBroke, no bailout on the same "day", next-day bailout, 25% penalty tax on a win', async () => {
+  await openGame();
+  const alice = await join('alice'); const bob = await join('bob');
+  const h3 = houseTimer('t3', { closeInMs: 1500 });
+  await ADMIN.ensureHouseMarkets([h3]);
+  const ab = await alice.s.placeBet(h3.id, 'quick', 500);
+  await bob.s.placeBet(h3.id, 'never', 10);
+  assert.equal(await alice.s.markBrokeIfNeeded(), false, 'not broke while the stake is open');
+  await waitUntil(h3.expiresAt);
+  await bob.s.finalizeMarket(h3.id);
+  await assert.rejects(alice.s.claimRestart(), /not broke/);
+  const lost = await alice.s.claimBet(ab.id);
+  assert.equal(lost.status, 'lost');
+  let pa = await player(alice.uid);
+  assert.equal(pa.balance, 0); assert.equal(pa.openStake, 0);
+  // align with a bailout "day" boundary (4s in the test rules) so the same-day check is deterministic
+  await sleep(TEST_BAILOUT_DAY_MS - (Date.now() % TEST_BAILOUT_DAY_MS) + 150);
+  assert.equal(await alice.s.markBrokeIfNeeded(), true);
+  assert.equal(await alice.s.markBrokeIfNeeded(), false);
+  pa = await player(alice.uid);
+  assert.ok(pa.brokeSince);
+  await assert.rejects(alice.s.claimRestart(), /rules rejected/, 'same day: denied by the rules');
+  assert.equal((await player(alice.uid)).balance, 0);
+  await sleep(TEST_BAILOUT_DAY_MS - (Date.now() % TEST_BAILOUT_DAY_MS) + 100);
+  await alice.s.claimRestart();
+  pa = await player(alice.uid);
+  assert.equal(pa.balance, 100); assert.equal(pa.bankruptcies, 1); assert.equal(pa.brokeSince, null);
+  assert.ok(pa.penaltyUntil > Date.now() + 2.9 * DAY_MS && pa.penaltyUntil < Date.now() + 3.1 * DAY_MS);
+  await assert.rejects(alice.s.claimRestart(), /not broke/);
+
+  // penalty: a winning bet pays 25% tax on the profit only
+  const h4 = houseTimer('t4', { closeInMs: 1500 });
+  await ADMIN.ensureHouseMarkets([h4]);
+  const wb = await alice.s.placeBet(h4.id, 'never', 40); // odds 1.5 -> gross 60, profit 20, tax 5
+  await waitUntil(h4.expiresAt);
+  await bob.s.finalizeMarket(h4.id);
+  const won = await alice.s.claimBet(wb.id);
+  assert.deepEqual([won.status, won.payout, won.taxed], ['won', 55, 5]);
+  pa = await player(alice.uid);
+  assert.equal(pa.balance, 100 - 40 + 55); assert.equal(pa.totalWon, 55);
+});
+
+it('payout parity: fixed odds with float edge cases, pool remainders and the penalty tax all match the rules to the sonnetous', async () => {
+  await openGame();
+  const alice = await join('alice');
+  const bettors = [await join('bob'), await join('carol'), await join('dave'), await join('erin')];
+  const [bob, carol, dave, erin] = bettors;
+  const closesAt = Date.now() + 5000;
+  const mkFixed = (tpl, odds) => economy.normalizeMarket({
+    id: `auto-${todayKey()}-${tpl}`, type: 'auto', templateId: tpl, kind: 'choice', mode: 'fixed', title: `Fixed ${tpl} odds`,
+    description: 'Counts if: test.', category: 'Test', emoji: '🎯', createdBy: 'house', createdByName: 'The House',
+    openedAt: Date.now(), closesAt, options: [{ id: 'o1', label: 'Yes', odds }, { id: 'o2', label: 'No', odds: 2 }],
+  });
+  const fixed = [['f1', 1.15, 100], ['f2', 1.8, 77], ['f3', 7.7, 33], ['f4', 19.99, 9]];
+  await ADMIN.ensureHouseMarkets(fixed.map(([t, o]) => mkFixed(t, o)));
+  const fbets = [];
+  for (let i = 0; i < 4; i++) fbets.push(await bettors[i].s.placeBet(`auto-${todayKey()}-${fixed[i][0]}`, 'o1', fixed[i][2]));
+  // a pool market with awkward remainders: 33 + 71 on o1, 17 + 101 on o2 (cooldowns: one bet per player)
+  await alice.s.createMarket(economy.buildCustomMarket({
+    id: 'pool1', player: { uid: alice.uid, username: 'alice' }, now: Date.now(), title: 'Pool remainder test', description: '',
+    kind: 'choice', optionLabels: ['A', 'B'], closesAt,
+  }));
+  await sleep(economy.BET_COOLDOWN_MS + 50);
+  const pbets = [
+    await bob.s.placeBet('pool1', 'o1', 33), await carol.s.placeBet('pool1', 'o1', 71),
+    await dave.s.placeBet('pool1', 'o2', 17), await erin.s.placeBet('pool1', 'o2', 101),
+  ];
+  await waitUntil(closesAt);
+  const ids = [...fixed.map(([t]) => `auto-${todayKey()}-${t}`), 'pool1'];
+  for (const id of ids.slice(0, 4)) await alice.s.reportResult(id, 'o1');
+  await alice.s.reportResult('pool1', 'o1');
+  await adminPatch('players', carol.uid, { penaltyUntil: Date.now() + DAY_MS }); // 25% tax on carol's profit
+  const reportedAt = Math.max(...(await Promise.all(ids.map((i) => market(i)))).map((m) => m.reportedAt));
+  await waitUntil(reportedAt + TEST_CHALLENGE_WINDOW_MS);
+  for (const id of ids) assert.equal((await erin.s.finalizeMarket(id)).status, 'resolved');
+  // fixed: gross = floor(amount*odds + 1e-9), i.e. 100*1.15 -> 115 (not 114), 77*1.8 -> 138, 33*7.7 -> 254, 9*19.99 -> 179;
+  // carol is under penalty: tax floor((138-77)*.25) = 15 on her profit only
+  const wantFixed = [[115, 0], [123, 15], [254, 0], [179, 0]];
+  for (let i = 0; i < 4; i++) {
+    const r = await bettors[i].s.claimBet(fbets[i].id);
+    assert.deepEqual([r.status, r.payout, r.taxed], ['won', ...wantFixed[i]], `fixed bet ${i}`);
+    assert.equal((await bet(fbets[i].id)).payout, wantFixed[i][0]);
+  }
+  // pool: floor(33*222/104)=70 ; carol floor(71*222/104)=151, taxed floor((151-71)*.25)=20 -> 131
+  // (bob/carol/dave/erin already claimed their fixed bets above, one claim per bet)
+  const pb = await bob.s.claimBet(pbets[0].id);
+  assert.deepEqual([pb.status, pb.payout, pb.taxed], ['won', 70, 0]);
+  const pc = await carol.s.claimBet(pbets[1].id);
+  assert.deepEqual([pc.status, pc.payout, pc.taxed], ['won', 131, 20]);
+  assert.equal((await dave.s.claimBet(pbets[2].id)).status, 'lost');
+  assert.equal((await erin.s.claimBet(pbets[3].id)).payout, 0);
+});
+
+it('every plain house template can be created under the rules; a custom timer with the default buckets is accepted', async () => {
+  await openGame();
+  const alice = await join('alice');
+  const now = Date.now();
+  const list = templates.PLAIN_TEMPLATE_LIST.map((t) => templates.buildAutoMarket(t, todayKey(), now));
+  assert.ok(list.length >= 20);
+  await ADMIN.ensureHouseMarkets(list);
+  const stored = await adminList('markets2');
+  assert.deepEqual(stored.map((m) => m.id).sort(), list.map((m) => m.id).sort(), 'the rules accepted every template');
+  // ...idempotent, and the stored docs equal what was built (no field dropped)
+  await ADMIN.ensureHouseMarkets(list);
+  assert.equal((await adminList('markets2')).length, list.length);
+  for (const m of list.slice(0, 3)) {
+    const { _id, ...doc } = stored.find((x) => x.id === m.id);
+    void _id;
+    assert.deepEqual(doc, JSON.parse(JSON.stringify(m)));
+  }
+  // custom timer market with the default buckets (pinned in the rules) + a bet on it
+  const t = economy.buildCustomMarket({ id: 'ctimer', player: { uid: alice.uid, username: 'alice' }, now: Date.now(), title: 'When will the pizza arrive?', description: '', kind: 'timer' });
+  await alice.s.createMarket(t);
+  const b = await alice.s.placeBet('ctimer', 'd1', 10);
+  assert.equal(b.odds, 6);
+  const stored2 = await market('ctimer');
+  assert.equal(stored2.expiresAt, t.closesAt + 8 * DAY_MS);
+  assert.equal(stored2.expiryOptionId, 'never');
+});
+
+it('subscriptions deliver live lists (newest first); logged-out calls are friendly and housekeeping never throws', async () => {
+  await openGame();
+  const alice = await join('alice'); const bob = await join('bob');
+  const lonely = await client('lonely');
+  assert.deepEqual(await first(lonely, 'subscribeMarkets'), [], 'signed out: empty list');
+  assert.deepEqual(await first(lonely, 'subscribePlayers'), []);
+  assert.deepEqual(await lonely.runHousekeeping(), { finalized: 0, claimed: 0, bonds: 0 });
+  await assert.rejects(lonely.placeBet('x', 'o1', 5), /logged in/);
+  await assert.rejects(lonely.markBrokeIfNeeded(), /logged in/);
+  await assert.rejects(lonely.claimAdmin('x'), /Sign in/);
+  const seen = [];
+  const off = alice.s.subscribeMarkets((l) => seen.push(l.map((m) => m.id)));
+  const betsSeen = [];
+  const offB = bob.s.subscribeBets((l) => betsSeen.push(l.map((b) => b.marketId)));
+  await alice.s.createMarket(choiceMarket(alice, 'old1', { closeInMs: 60000 }));
+  await sleep(30);
+  await alice.s.createMarket(choiceMarket(alice, 'new1', { closeInMs: 60000 }));
+  await until2(() => seen.some((l) => l.join() === 'new1,old1'));
+  await bob.s.placeBet('old1', 'o1', 5);
+  await sleep(economy.BET_COOLDOWN_MS + 50);
+  await bob.s.placeBet('new1', 'o1', 5);
+  await until2(() => betsSeen.some((l) => l.join() === 'new1,old1'));
+  const players = await first(bob.s, 'subscribePlayers', (l) => l.length === 3 && l.find((p) => p.username === 'bob').balance === 490);
+  assert.equal(players.find((p) => p.username === 'bob').openStake, 10);
+  off(); offB();
+  // a house market and housekeeping on an idle client: nothing to do, no throw
+  assert.deepEqual(await alice.s.runHousekeeping(), { finalized: 0, claimed: 0, bonds: 0 });
+  // concurrent housekeeping calls share one run
+  const [h1, h2] = await Promise.all([bob.s.runHousekeeping(), bob.s.runHousekeeping()]);
+  assert.deepEqual(h1, h2);
+});
+
+it('oracle house markets (price / weather / wiki / quake / sports templates) are accepted by the rules too', async () => {
+  await openGame();
+  const alice = await join('alice');
+  const fx = (name) => JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
+  const fakeFetch = async (url) => {
+    const u = String(url);
+    let body;
+    if (u.includes('coinbase') && u.includes('ticker')) body = fx('coinbase-ticker-btc.json');
+    else if (u.includes('coinbase')) body = fx('coinbase-candles-btc-1h.json');
+    else if (u.includes('open-meteo')) body = fx(u.includes('latitude=40') ? 'openmeteo-forecast-nyc.json' : 'openmeteo-forecast-london.json');
+    else if (u.includes('wikimedia')) {
+      body = { items: Array.from({ length: 30 }, (_, i) => ({ timestamp: `2026${String(9).padStart(2, '0')}${String(i + 1).padStart(2, '0')}00`, views: 1000 + i * 37 })) };
+    } else if (u.includes('espn')) body = fx('espn-scoreboard-nba-pre.json');
+    else body = {};
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const now = Date.now();
+  const list = await templates.buildDailyMarkets(todayKey(), now, {
+    fetchers: (await import('../js/oracles.js')).createFetchers({ fetch: fakeFetch }), oracleCount: 12, otherCount: 0, maxOracleAttempts: 40,
+  });
+  const oracles = list.filter((m) => m.oracle);
+  assert.ok(oracles.length >= 2, `built ${oracles.length} oracle markets`);
+  await ADMIN.ensureHouseMarkets(list);
+  const stored = new Set((await adminList('markets2')).map((m) => m.id));
+  for (const m of list) assert.ok(stored.has(m.id), `rules accepted ${m.id} (${m.oracle ? m.oracle.type : 'plain'})`);
+});
+
+it('house markets are admin-only: ensureHouseMarkets is a silent no-op for players, works for the admin', async () => {
+  const admin = await openGame();
+  const alice = await join('alice');
+  const h = houseTimer('tadm', { closeInMs: 30000 });
+  await alice.s.ensureHouseMarkets([h]); // no throw, no write
+  assert.equal((await adminList('markets2')).length, 0);
+  await admin.ensureHouseMarkets([h]);
+  assert.deepEqual((await adminList('markets2')).map((m) => m.id), [h.id]);
+  assert.equal((await alice.s.placeBet(h.id, 'never', 10)).marketId, h.id);
 });

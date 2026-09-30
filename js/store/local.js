@@ -333,7 +333,8 @@ export function createLocalStore(options = {}) {
     async ensureHouseMarkets(markets) {
       const db = load();
       const now = nowFn();
-      const { player } = actor(db);
+      const { uid, player } = actor(db);
+      if (!isAdmin(db, uid)) return; // only the admin creates the daily house markets (rules enforce the same)
       let changed = false;
       for (const raw of markets || []) {
         if (!raw || !raw.id || db.markets[raw.id]) continue;

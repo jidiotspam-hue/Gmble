@@ -60,8 +60,8 @@ Bet = { id, marketId, marketTitle, uid, username, optionId, optionLabel, amount,
 - **Nothing may be deleted** except `bans/{uid}` by admin.
 
 ## Admin
-- **Claim**: create `app/config` only if it doesn't exist, with `adminUid == auth.uid`, `maintenance == true`, and
-  `hashing.sha256(request.resource.data.claimCode).toHexString().lower() == '327ed216b034673656912e0eb7aa10b4b953933a1fd04ff136589337b9072bb1'`.
+- **Claim**: create `app/config` only if it doesn't exist, with `adminUid == auth.uid`, `maintenance == true`; the code is written to a write-only `app/claim` doc in the same batch (never to
+  the public config) and checked as `hashing.sha256(request.resource.data.claimCode).toHexString().lower() == '327ed216b034673656912e0eb7aa10b4b953933a1fd04ff136589337b9072bb1'`.
   (Verify `hashing.sha256` works in the emulator; the code itself is NEVER written to the repo — tests use a test-only hash
   by templating the rules file or a separate test rules file generated from the real one with the hash swapped.)
 - **Update config**: admin only; may change `maintenance`, `updatedAt` only.
@@ -77,8 +77,8 @@ Bet = { id, marketId, marketTitle, uid, username, optionId, optionLabel, amount,
    Market must be status open, request.time < closesAt, opt ∈ optionIds, amount int 1..balance, bet.odds == oddsById[opt] (fixed) or null (pool).
 3. **createMarket** (custom): create `markets2/{id}` with createdBy == me, status open, zero totals; player marketsDay/marketsCount
    updated (≤ 5 per UTC day). Choice ⇒ pool mode; timer ⇒ fixed default buckets. Odds within [1.01, 20].
-   **Auto (house) markets**: any signed-in player may create id `auto-{utcDateKey}-{templateId}` with createdBy 'house', odds within bounds.
-   (Clients compare house markets to the deterministic template and show a ⚠ badge if they don't match.)
+   **Auto (house) markets**: only the ADMIN may create id `auto-{utcDateKey}-{templateId}` with createdBy 'house', odds within bounds
+   (non-admin `ensureHouseMarkets` is a no-op, so the day's house markets appear once the admin opens the app). (Clients compare house markets to the deterministic template and show a ⚠ badge if they don't match.)
 4. **reportResult(marketId, optionId, eventAt, evidence)**: market open → reported. Custom markets: only creator may report.
    House markets: anyone. Requires request.time ≥ reportableAt. Timer: eventAt ∈ [openedAt, request.time] and
    `bucketsById[optionId]` contains `eventAt − openedAt`. Reporter pays BOND (player balance −20, lastBondMarketId = m) in same batch.

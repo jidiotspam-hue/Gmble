@@ -313,7 +313,7 @@ test('placeBet validation: funds, options, closing time, unknown market, whole n
 test('fixed-odds house market locks the odds on the bet', async () => {
   const w = await openWorld();
   const a = await user(w, 'alice');
-  await a.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-coin', { a: 2.5, b: 1.5 })]);
+  await w.admin.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-coin', { a: 2.5, b: 1.5 })]);
   const bet = await a.placeBet('auto-2026-01-10-coin', 'a', 40);
   assert.equal(bet.odds, 2.5);
 });
@@ -362,12 +362,21 @@ test('createMarket rejects duplicates, impersonation, tampered totals and house 
 test('ensureHouseMarkets: creates missing ids only, skips invalid odds, needs no daily quota', async () => {
   const w = await openWorld();
   const a = await user(w, 'alice');
-  await a.ensureHouseMarkets([houseFixed(w), houseFixed(w, 'auto-2026-01-10-bad', { a: 25, b: 2 }), houseFixed(w, 'not-an-auto-id')]);
+  await w.admin.ensureHouseMarkets([houseFixed(w), houseFixed(w, 'auto-2026-01-10-bad', { a: 25, b: 2 }), houseFixed(w, 'not-an-auto-id')]);
   assert.deepEqual(markets(a).map((m) => m.id), ['auto-2026-01-10-coin']);
   advance(w, 5000);
-  await a.ensureHouseMarkets([{ ...houseFixed(w), title: 'Replaced' }]); // existing id: untouched
+  await w.admin.ensureHouseMarkets([{ ...houseFixed(w), title: 'Replaced' }]); // existing id: untouched
   assert.equal(market(a, 'auto-2026-01-10-coin').title, 'Coin flip');
   assert.equal(me(a).marketsCount, 0);
+});
+
+test('ensureHouseMarkets is admin-only: a no-op (no throw, no writes) for everyone else', async () => {
+  const w = await openWorld();
+  const a = await user(w, 'alice');
+  await a.ensureHouseMarkets([houseFixed(w)]);
+  assert.deepEqual(markets(a), []);
+  await w.admin.ensureHouseMarkets([houseFixed(w)]);
+  assert.deepEqual(markets(a).map((m) => m.id), ['auto-2026-01-10-coin']);
 });
 
 // ---------------------------------------------------------------- report / challenge / vote / finalize
@@ -390,7 +399,7 @@ test('only the creator may report a custom market; anyone may report a house mar
   await rejects(alice.placeBet('m1', 'o1', 1), /closed/i);
 
   // house market: anyone
-  await alice.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-h1')]);
+  await w.admin.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-h1')]);
   advance(w, 2 * HOUR_MS);
   await alice.reportResult('auto-2026-01-10-h1', 'a', null, null);
   assert.equal(market(alice, 'auto-2026-01-10-h1').status, 'reported');
@@ -702,7 +711,7 @@ test('bankruptcy => next-UTC-midnight bailout => 25% winnings tax for 3 days', a
   w.clock.t = Date.UTC(2026, 0, 10, 20, 0, 0);
   const a = await user(w, 'alice');
   const b = await user(w, 'bob');
-  await a.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-h1'), houseFixed(w, 'auto-2026-01-10-h2')]);
+  await w.admin.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-10-h1'), houseFixed(w, 'auto-2026-01-10-h2')]);
   await a.placeBet('auto-2026-01-10-h1', 'a', 500); // all in
   await b.placeBet('auto-2026-01-10-h1', 'b', 10);
   advance(w, HOUR_MS);
@@ -730,7 +739,7 @@ test('bankruptcy => next-UTC-midnight bailout => 25% winnings tax for 3 days', a
   await rejects(a.claimRestart(), /not broke/i);
 
   // a winning bet during the penalty: profit is taxed 25%
-  await a.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-11-h3', { a: 3, b: 3 })]);
+  await w.admin.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-11-h3', { a: 3, b: 3 })]);
   const won = await a.placeBet('auto-2026-01-11-h3', 'a', 100); // gross 300, profit 200, tax 50
   advance(w, HOUR_MS);
   await b.reportResult('auto-2026-01-11-h3', 'a', null, 'https://example.com/heads');
@@ -744,7 +753,7 @@ test('bankruptcy => next-UTC-midnight bailout => 25% winnings tax for 3 days', a
 
   // after the penalty expires, no tax
   w.clock.t = p.penaltyUntil;
-  await a.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-14-h4', { a: 3, b: 3 })]);
+  await w.admin.ensureHouseMarkets([houseFixed(w, 'auto-2026-01-14-h4', { a: 3, b: 3 })]);
   assert.equal(me(a).balance, 250);
   const later = await a.placeBet('auto-2026-01-14-h4', 'a', 100);
   advance(w, HOUR_MS);
@@ -760,7 +769,7 @@ test('markBrokeIfNeeded only marks genuinely broke players once', async () => {
   const b = await user(w, 'bob');
   await a.markBrokeIfNeeded();
   assert.equal(me(a).brokeSince, null);
-  await a.ensureHouseMarkets([houseFixed(w)]);
+  await w.admin.ensureHouseMarkets([houseFixed(w)]);
   await a.placeBet('auto-2026-01-10-coin', 'a', 500);
   await a.markBrokeIfNeeded(); // has an open stake => not broke
   assert.equal(me(a).brokeSince, null);

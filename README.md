@@ -6,23 +6,23 @@ A tiny betting app for you and your friends, hosted free on GitHub Pages. The cu
 **sonnetous** (`§`). No real money, just bragging rights.
 
 ## Rules
-- New accounts start with **§500**.
-- Bet on **house markets** (4 new ones auto-generated every day, e.g. *"How long till Trump violates the
-  constitution again?"*) or **create your own** market about anything.
-- **Timer markets** ("How long till…?") have time buckets. The sooner the bucket, the higher the payout:
-  | Bucket | Pays |
-  |---|---|
-  | Within 1 day | ×6 |
-  | 1–4 days | ×3 |
-  | 4–8 days | ×1.8 |
-  | 8+ days | ×1.3 |
-
-  Anyone can hit **"It happened!"** with the time it happened, and the matching bucket wins. If nobody reports it
-  within 8 days, "8+ days" wins automatically.
-- **Choice markets** you create are **pool bets**: the winners split the whole pot in proportion to their stake.
-  The creator resolves (or voids and refunds) their own market.
-- **Going broke**: if you hit §0 with no open bets, you can claim a **§100 bailout the next day**. The penalty is a
-  💀 on the leaderboard forever and a **25% tax on your winnings' profit for 3 days**.
+- New accounts start with **§500**. Bets are whole sonnetous; one bet every 2 seconds max.
+- **House markets**: a fresh set every UTC day (created when the admin opens the app). "How long till a court says a
+  Trump action is unconstitutional?" runs every day, plus data-settled markets (crypto prices, earthquakes, weather,
+  Wikipedia battles, sports) and a couple of news/friend-group ones with explicit "Counts if" criteria.
+- **Custom markets**: up to 5 per day. Choice markets are pool bets (winners split the pot); timer markets use the
+  standard buckets (within 1 day ×6 · 1–4 days ×3 · 4–8 days ×1.8 · 8+ days ×1.3).
+- **Timer bets start their clock when you bet.** If the thing already happened before your bet, you're refunded.
+- **Results are reported, not trusted**: reporting costs a §20 bond. Anyone can challenge within 12h (also §20); then
+  players who didn't bet on that market vote for 24h. Losers of a dispute forfeit their bond to the winner; no votes
+  or a tie voids the market (everyone refunded). Data-settled markets are auto-reported by the app, and every
+  player's app re-checks the data and auto-challenges a wrong report.
+- **Going broke**: at §0 with no open bets you can claim a **§100 bailout from the next UTC day**. Penalty: a 💀 on the
+  leaderboard forever and a **25% tax on winnings' profit for 3 days**.
+- **Admin**: one account claims admin with a secret code (only its hash is in the repo). The admin panel can turn
+  **maintenance** on (blocks everyone but the admin) and **ban/unban** players. All of this, and every balance change,
+  is enforced by `firestore.rules` on Firebase's servers — players can only ever write their own account, and every
+  payout must match a real bet, bond or bailout.
 
 ## Play online with friends (5-minute Firebase setup)
 Out of the box the app runs in **local mode**: everything is stored in your browser, so friends can only share
