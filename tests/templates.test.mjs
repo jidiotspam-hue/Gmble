@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { TEMPLATES, pickDailyTemplates, buildAutoMarket, dailyMarkets } from '../js/templates.js';
+import { TEMPLATES, FEATURED_TEMPLATE_IDS, pickDailyTemplates, buildAutoMarket, dailyMarkets } from '../js/templates.js';
 import { DEFAULT_TIMER_BUCKETS, HOUR_MS, timerAutoResolution, timerBucketFor, DAY_MS, isBettingOpen, validateBet, newUser } from '../js/economy.js';
 
 const NOW = Date.UTC(2026, 5, 15, 12, 0, 0);
@@ -184,13 +184,24 @@ describe('buildAutoMarket / dailyMarkets', () => {
 
   test('dailyMarkets ids', () => {
     const ms = dailyMarkets(KEY, NOW);
-    assert.equal(ms.length, 4);
-    const expected = pickDailyTemplates(KEY).map((t) => `auto-${KEY}-${t.id}`);
-    assert.deepEqual(ms.map((m) => m.id), expected);
-    assert.equal(new Set(ms.map((m) => m.id)).size, 4);
+    assert.equal(ms.length, 4 + FEATURED_TEMPLATE_IDS.length);
+    const ids = ms.map((m) => m.id);
+    assert.deepEqual(ids.slice(0, FEATURED_TEMPLATE_IDS.length), FEATURED_TEMPLATE_IDS.map((id) => `auto-${KEY}-${id}`));
+    assert.ok(ids.every((id) => id.startsWith(`auto-${KEY}-`)));
+    assert.equal(new Set(ids).size, ids.length);
     assert.ok(ms.every((m) => m.openedAt === NOW));
-    assert.equal(dailyMarkets(KEY, NOW, 6).length, 6);
+    assert.equal(dailyMarkets(KEY, NOW, 6).length, 6 + FEATURED_TEMPLATE_IDS.length);
     // idempotent ids regardless of `now`
-    assert.deepEqual(dailyMarkets(KEY, NOW + 5000).map((m) => m.id), expected);
+    assert.deepEqual(dailyMarkets(KEY, NOW + 5000).map((m) => m.id), ids);
+  });
+
+  test('featured markets run every day', () => {
+    assert.ok(FEATURED_TEMPLATE_IDS.includes('trump-constitution'));
+    for (let d = 1; d <= 30; d++) {
+      const key = `2026-09-${String(d).padStart(2, '0')}`;
+      const ids = dailyMarkets(key, NOW).map((m) => m.id);
+      assert.ok(ids.includes(`auto-${key}-trump-constitution`));
+      assert.equal(new Set(ids).size, ids.length);
+    }
   });
 });

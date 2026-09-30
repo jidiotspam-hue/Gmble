@@ -271,6 +271,14 @@ export function buildAutoMarket(template, dateKey, now) {
   };
 }
 
+/** Templates that run every single day, on top of the random daily picks. */
+export const FEATURED_TEMPLATE_IDS = ['trump-constitution'];
+
+/** Featured templates first, then `count` random (non-featured) picks for the day. */
 export function dailyMarkets(dateKey, now, count = 4) {
-  return pickDailyTemplates(dateKey, count).map((t) => buildAutoMarket(t, dateKey, now));
+  const featured = FEATURED_TEMPLATE_IDS.map((id) => TEMPLATES.find((t) => t.id === id)).filter(Boolean);
+  const random = pickDailyTemplates(dateKey, count + featured.length)
+    .filter((t) => !FEATURED_TEMPLATE_IDS.includes(t.id))
+    .slice(0, count);
+  return [...featured, ...random].map((t) => buildAutoMarket(t, dateKey, now));
 }
