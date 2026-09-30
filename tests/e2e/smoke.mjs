@@ -1,27 +1,29 @@
-// End-to-end smoke test for Sonnetous (local mode). Drives the real app in headless Chromium.
+// End-to-end smoke test for Sonnetous v2 (local mode). Drives the real app in headless Chromium.
 //
 //   python3 -m http.server 8123 &          # serve the repo root
 //   node tests/e2e/smoke.mjs               # BASE_URL=http://localhost:8123 by default
 //
-// Needs the `playwright` npm package (resolved normally, else from PLAYWRIGHT_MODULE or the
-// shared scratch install). Not picked up by `node --test` (file is not named *.test.mjs).
+// Needs the `playwright` npm package (resolved normally, else from PLAYWRIGHT_MODULE or the shared scratch
+// install). Not picked up by `node --test` (file is not named *.test.mjs).
+//   SHOTS_DIR=/path   where screenshots go (default: $TMPDIR/sonnetous-e2e)
+//   FONT_DIR=/path    optional local copy of the Google Fonts CSS + woff2 files (fonts.css + <path with / → _>)
 // Time travel: a page init script wraps Date so that "now" = real now + localStorage['qa:offset'].
+// External data APIs are stubbed: only the USGS quake feed returns data (controlled by the test), everything else
+// answers `{}` so oracle templates that need a baseline are skipped and the daily set is deterministic.
 // Exits 1 on the first failure (screenshot of the failing page is saved in SHOTS_DIR).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 const BASE = process.env.BASE_URL || 'http://localhost:8123';
 const SHOTS = process.env.SHOTS_DIR || path.join(os.tmpdir(), 'sonnetous-e2e');
+const FONT_DIR = process.env.FONT_DIR || '';
 fs.mkdirSync(SHOTS, { recursive: true });
 
-// Always run in local mode, even when js/config.js has a real Firebase config,
-// so the smoke test never writes to the live database.
-async function forceLocalMode(context) {
-  await context.route('**/js/config.js', (route) =>
-    route.fulfill({ contentType: 'text/javascript', body: 'export const FIREBASE_CONFIG = null;\n' }));
-}
+const ADMIN_CODE = 'smoke-test-admin-code';
+const ADMIN_HASH = crypto.createHash('sha256').update(ADMIN_CODE).digest('hex');
 
 async function loadPlaywright() {
   const candidates = [
@@ -41,9 +43,11 @@ const chromium = pw.chromium || pw.default.chromium;
 
 // ------------------------------------------------------------------ tiny harness
 const problems = [];      // console errors / page errors / alerts
-const DAY = 86_400_000;
-let offset = 0;           // simulated time offset (ms) shared by every page in the context
+const HOUR = 3_600_000;
+const MIN = 60_000;
+let offset = 0;
 let step = 0;
+const quake = { mag: null, time: null }; // USGS fixture: one event of `mag` at `time` (ms) when set
 
 function assert(cond, msg) {
   if (!cond) throw new Error('ASSERT: ' + msg);
@@ -62,14 +66,43 @@ const INIT = () => {
   globalThis.Date = FakeDate;
 };
 
+async function setupRoutes(context) {
+  // Always local mode (never touch the live database) + a test-only admin code hash.
+  await context.route('**/js/config.js', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: 'export const FIREBASE_CONFIG = null;\n' }));
+  await context.route('**/js/admin-hash.js', (route) =>
+    route.fulfill({ contentType: 'text/javascript', body: `export const ADMIN_CODE_SHA256 = '${ADMIN_HASH}';\n` }));
+  await context.route((url) => url.hostname !== 'localhost' && url.hostname !== '127.0.0.1', (route) => {
+    const url = new URL(route.request().url());
+    const cors = { 'access-control-allow-origin': '*' };
+    if (url.hostname === 'fonts.googleapis.com') {
+      const css = FONT_DIR && fs.existsSync(path.join(FONT_DIR, 'fonts.css')) ? fs.readFileSync(path.join(FONT_DIR, 'fonts.css'), 'utf8') : '';
+      return route.fulfill({ contentType: 'text/css', body: css, headers: cors });
+    }
+    if (url.hostname === 'fonts.gstatic.com') {
+      const f = path.join(FONT_DIR, url.pathname.replace(/^\//, '').replace(/\//g, '_'));
+      if (FONT_DIR && fs.existsSync(f)) return route.fulfill({ contentType: 'font/woff2', body: fs.readFileSync(f), headers: cors });
+      return route.fulfill({ status: 200, contentType: 'font/woff2', body: '', headers: cors });
+    }
+    if (url.hostname === 'earthquake.usgs.gov') {
+      const minMag = Number(url.searchParams.get('minmagnitude'));
+      const features = quake.time != null && minMag <= quake.mag
+        ? [{ properties: { mag: quake.mag, time: quake.time, type: 'earthquake', url: 'https://earthquake.usgs.gov/earthquakes/eventpage/smoke1' } }]
+        : [];
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ type: 'FeatureCollection', features }), headers: cors });
+    }
+    return route.fulfill({ contentType: 'application/json', body: '{}', headers: cors });
+  });
+}
+
 async function newPage(ctx, name = 'page') {
   const page = await ctx.newPage();
   page.qaName = name;
   page.on('console', (m) => { if (m.type() === 'error') problems.push(`console.error [${name}]: ${m.text()}`); });
   page.on('pageerror', (e) => problems.push(`pageerror [${name}]: ${e.message}`));
   page.on('dialog', async (d) => {
-    if (d.type() === 'confirm') await d.accept();
-    else { problems.push(`unexpected ${d.type()} dialog [${name}]: ${d.message()}`); await d.dismiss(); }
+    problems.push(`unexpected native ${d.type()} dialog [${name}]: ${d.message()}`);
+    await d.dismiss();
   });
   return page;
 }
@@ -77,103 +110,153 @@ async function newPage(ctx, name = 'page') {
 async function goto(page) {
   await page.goto(BASE + '/index.html');
   await page.waitForFunction(() => document.getElementById('boot').hidden);
-  assert(await page.locator('#fatal').isHidden(), 'fatal error screen shown');
+  assert(await page.locator('#fatal').isHidden(), 'fatal error screen shown: ' + (await page.textContent('#fatal-msg').catch(() => '')));
 }
 
 async function setOffset(page, ms) {
   offset = ms;
   await page.evaluate((v) => localStorage.setItem('qa:offset', String(v)), ms);
 }
+const fakeNow = () => Date.now() + offset;
 
 async function shot(page, name, fullPage = false) {
+  await sleep(250); // let entry animations settle
   await page.screenshot({ path: path.join(SHOTS, name), fullPage });
 }
 
 // ------------------------------------------------------------------ app helpers
+const visible = (page, sel) => page.locator(sel).waitFor({ state: 'visible' });
+
 async function authAs(page, mode, user, pass) {
-  await page.locator('#auth').waitFor({ state: 'visible' });
+  await visible(page, '#auth');
   await page.click(`[data-auth-mode=${mode}]`);
-  await page.fill('#auth-form [name=username]', user);
-  await page.fill('#auth-form [name=password]', pass);
+  await page.fill('#auth-username', user);
+  await page.fill('#auth-password', pass);
   await page.click('#auth-submit');
+}
+async function waitUser(page, user) {
+  await visible(page, '#app');
+  await page.waitForFunction((u) => document.getElementById('h-user').textContent === u, user);
 }
 async function signUp(page, user, pass = 'secret123') {
   await authAs(page, 'signup', user, pass);
-  await page.locator('#app').waitFor({ state: 'visible' });
-  await page.waitForFunction((u) => document.getElementById('h-user').textContent === u, user);
+  await waitUser(page, user);
 }
 async function login(page, user, pass = 'secret123') {
   await authAs(page, 'signin', user, pass);
-  await page.locator('#app').waitFor({ state: 'visible' });
-  await page.waitForFunction((u) => document.getElementById('h-user').textContent === u, user);
+  await waitUser(page, user);
 }
 async function logout(page) {
-  await page.click('#btn-logout');
-  await page.locator('#auth').waitFor({ state: 'visible' });
+  await closeSheet(page);
+  await page.click('#btn-profile');
+  await page.click('#profile [data-logout]');
+  await page.locator('#app').waitFor({ state: 'hidden' });
 }
-const balance = async (page) =>
-  parseInt((await page.textContent('#h-balance')).replace(/[^\d-]/g, ''), 10);
+async function gateLogin(page, mode, user, pass = 'secret123') {
+  await visible(page, '#gate');
+  const d = page.locator('#gate-admin');
+  if (!(await d.evaluate((el) => el.open))) await page.click('#gate-admin summary');
+  await page.click(`[data-gate-mode=${mode}]`);
+  await page.fill('#gate-user', user);
+  await page.fill('#gate-pass', pass);
+  await page.click('#gate-login [type=submit]');
+}
+const balance = async (page) => parseInt((await page.textContent('#h-balance')).replace(/[^\d-]/g, ''), 10);
 async function waitBalance(page, n) {
-  await page.waitForFunction((t) => document.getElementById('h-balance').textContent === t, fmtN(n), { timeout: 5000 })
+  await page.waitForFunction((t) => document.getElementById('h-balance').textContent === t, fmtN(n), { timeout: 6000 })
     .catch(async () => { throw new Error(`ASSERT: balance expected ${fmtN(n)}, got ${await page.textContent('#h-balance')}`); });
 }
 async function tab(page, id) {
-  await page.click(`[data-tab=${id}]`);
-  await page.locator(`#panel-${id}`).waitFor({ state: 'visible' });
-  await sleep(120); // views render on a 0ms timeout after the tab switch
+  await closeSheet(page);
+  const isDesktop = (page.viewportSize() || {}).width >= 900;
+  await page.click(`${isDesktop ? '.topnav' : '.tabbar'} [data-tab=${id}]`);
+  await visible(page, `#panel-${id}`);
+  await sleep(120);
 }
 async function filter(page, id) {
   await tab(page, 'markets');
   await page.click(`[data-filter=${id}]`);
-  await page.waitForFunction((f) => document.querySelector(`[data-filter=${f}]`).classList.contains('active'), id);
+  await page.waitForFunction((f) => document.querySelector(`[data-filter=${f}]`).getAttribute('aria-pressed') === 'true', id);
+  await sleep(80);
 }
-const card = (page, title) => page.locator('#panel-markets article.market').filter({ has: page.locator(`h3:text-is(${JSON.stringify(title)})`) });
-const TRUMP = 'How long till Trump violates the constitution again?';
-
-async function bet(page, c, optionLabel, amount) {
-  await c.locator('.opt', { hasText: optionLabel }).first().click();
-  await c.locator('[data-role=amount]').fill(String(amount));
-  const btn = c.locator('[data-action=bet]');
-  await btn.waitFor();
-  await page.waitForFunction((el) => !el.disabled, await btn.elementHandle());
-  await btn.click();
-  await page.locator('.toast-success', { hasText: 'Bet placed' }).last().waitFor();
+const card = (page, title) => page.locator('#panel-markets article.mcard').filter({ has: page.locator('.mcard-link').getByText(title, { exact: true }) });
+async function openMarket(page, title) {
+  await card(page, title).first().locator('.mcard-link').click();
+  await visible(page, '#sheet[open] #sheet-title');
+  await page.waitForFunction((t) => document.getElementById('sheet-title').textContent === t, title);
+  await sleep(150);
+  const over = await page.evaluate(() => {
+    const b = document.getElementById('sheet-body');
+    return b.scrollWidth - b.clientWidth;
+  });
+  assert(over <= 0, `market sheet "${title}" overflows horizontally by ${over}px`);
 }
-
-async function createChoice(page, title, labels, description = '') {
-  await tab(page, 'create');
-  await page.fill('#panel-create [name=title]', title);
-  if (description) await page.fill('#panel-create [name=description]', description);
-  await page.check('#panel-create [name=kind][value=choice]');
-  while ((await page.locator('#panel-create [data-role=label]').count()) < labels.length) {
-    await page.click('[data-role=add-option]');
+async function closeSheet(page) {
+  if (await page.locator('#sheet[open]').count()) {
+    await page.keyboard.press('Escape'); // keyboard-operable dialog
+    await page.locator('#sheet[open]').waitFor({ state: 'detached' }).catch(() => {});
+    await page.waitForFunction(() => !document.getElementById('sheet').open);
   }
-  const inputs = page.locator('#panel-create [data-role=label]');
+}
+const sheet = (page) => page.locator('#sheet');
+async function toastWait(page, text, type = 'success') {
+  await page.locator(`.toast-${type}`, { hasText: text }).last().waitFor({ timeout: 8000 });
+}
+async function placeBet(page, optionLabel, amount) {
+  const s = sheet(page);
+  await s.locator('[data-pick]', { hasText: optionLabel }).first().click();
+  await s.locator('[data-key=amount]').fill(String(amount));
+  const btn = s.locator('[data-act=bet]');
+  await page.waitForFunction(() => { const b = document.querySelector('#sheet [data-act=bet]'); return b && !b.disabled; });
+  assert((await s.locator('[data-preview]').textContent()).includes('profit'), 'bet slip shows the win/profit preview');
+  await btn.click();
+  await toastWait(page, 'Bet placed');
+  await sleep(2100); // bet cooldown
+}
+async function confirmModal(page) {
+  await visible(page, '#modal[open] [data-m=ok]');
+  await page.click('#modal [data-m=ok]');
+  await page.locator('#modal[open]').waitFor({ state: 'detached' }).catch(() => {});
+}
+async function createChoice(page, title, labels, description = '', closeIn = '3600000') {
+  await tab(page, 'create');
+  await page.check('#panel-create [name=kind][value=choice]', { force: true });
+  await page.fill('#c-title', title);
+  if (description) await page.fill('#c-desc', description);
+  while ((await page.locator('#panel-create [data-opt]').count()) < labels.length) await page.click('[data-add-opt]');
+  const inputs = page.locator('#panel-create [data-opt]');
   for (let i = 0; i < labels.length; i++) await inputs.nth(i).fill(labels[i]);
-  await page.click('#panel-create [type=submit]');
-  await page.locator('.toast-success', { hasText: 'Market created' }).last().waitFor();
-  await page.locator('#panel-markets').waitFor({ state: 'visible' });
+  await page.click(`[data-close-in="${closeIn}"]`);
+  await page.click('#panel-create [data-submit]');
+  await toastWait(page, 'Market created');
+  await visible(page, '#sheet[open]');
+  await closeSheet(page);
 }
 
 async function noHScroll(page, label) {
-  for (const t of ['markets', 'create', 'mybets', 'leaderboard', 'activity']) {
-    await tab(page, t);
-    const over = await page.evaluate(() => Math.max(
-      document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth);
+  const tabs = ['markets', 'create', 'mybets', 'leaderboard', 'activity'];
+  if (await page.locator('#nav-admin:not([hidden])').count()) tabs.push('admin');
+  for (const t of tabs) {
+    if (t === 'admin') {
+      await closeSheet(page);
+      await page.click('#btn-profile');
+      await page.click('#profile [data-go=admin]');
+      await visible(page, '#panel-admin');
+      await sleep(120);
+    } else await tab(page, t);
+    const over = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth);
     assert(over <= 0, `horizontal scroll (${over}px) on ${t} tab [${label}]`);
-    // content must also stay inside its own card (clipped overflow does not show up in scrollWidth)
     const spill = await page.evaluate((id) => {
       const out = [];
-      for (const card of document.querySelectorAll(`#panel-${id} .panel-card`)) {
-        const r = card.getBoundingClientRect();
-        for (const el of card.querySelectorAll('table, td, th, li, .badge')) {
-          const b = el.getBoundingClientRect();
-          if (b.width && b.right > r.right + 1) out.push(el.tagName + ':' + el.textContent.trim().slice(0, 20));
-        }
+      const vw = window.innerWidth;
+      for (const el of document.querySelectorAll(`#panel-${id} *`)) {
+        const b = el.getBoundingClientRect();
+        if (!b.width || el.closest('.scroller')) continue;
+        if (b.right > vw + 1 || b.left < -1) out.push(`${el.tagName}.${el.className}`.slice(0, 50));
       }
       return out;
     }, t);
-    assert(spill.length === 0, `content spills out of its card on ${t} tab [${label}]: ${spill.slice(0, 3).join(' | ')}`);
+    assert(spill.length === 0, `content outside the viewport on ${t} tab [${label}]: ${spill.slice(0, 3).join(' | ')}`);
   }
   await tab(page, 'markets');
 }
@@ -186,367 +269,357 @@ function noProblems(where) {
 const browser = await chromium.launch();
 let current = null;
 try {
-  // ============================================================ mobile run
   const ctx = await browser.newContext({ viewport: { width: 375, height: 812 }, isMobile: true, hasTouch: false });
-  await forceLocalMode(ctx);
+  await setupRoutes(ctx);
   await ctx.addInitScript(INIT);
   const page = await newPage(ctx, 'main');
   current = page;
   await goto(page);
-  await page.locator('#auth').waitFor({ state: 'visible' });
-  assert((await page.textContent('#auth-local')).includes('Local mode'), 'local-mode banner missing');
 
-  // ---- 1. accounts
-  log('sign up alice / duplicate / wrong password / bob');
+  // ---- 1. maintenance: nobody gets in before the admin claims
+  log('fresh install shows the maintenance screen to visitors');
+  await visible(page, '#gate');
+  assert((await page.textContent('#gate')).includes('closed'), 'maintenance copy');
+  assert(await page.locator('#auth').isHidden(), 'no login screen while closed');
+  await shot(page, 'maintenance-375.png');
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await shot(page, 'maintenance-1280.png');
+  await page.setViewportSize({ width: 375, height: 812 });
+
+  log('a normal user who signs up during maintenance still sees the maintenance screen');
+  await gateLogin(page, 'signup', 'carol');
+  await page.waitForFunction(() => /Signed in as/.test(document.getElementById('gate').textContent));
+  assert((await page.textContent('#gate')).includes('carol'), 'shows who is signed in');
+  assert(await page.locator('#app').isHidden(), 'carol must not get into the app');
+  await page.click('[data-gate-logout]');
+  await page.waitForFunction(() => !/Signed in as/.test(document.getElementById('gate').textContent));
+
+  // ---- 2. admin claim
+  log('admin signs up, wrong code rejected, right code claims admin');
+  await gateLogin(page, 'signup', 'boss');
+  await visible(page, '#gate-code');
+  await page.fill('#gate-code', 'nope');
+  await page.click('#gate-claim [type=submit]');
+  await page.locator('#gate-claim .form-error').waitFor({ state: 'visible' });
+  await page.fill('#gate-code', ADMIN_CODE);
+  await page.click('#gate-claim [type=submit]');
+  await waitUser(page, 'boss');
+  await visible(page, '#pill-maint');
+  await toastWait(page, "You're the admin");
+
+  log('admin turns maintenance off');
+  await page.click('#pill-maint [data-tab=admin]');
+  await visible(page, '#panel-admin');
+  await page.click('[data-admin=maint]');
+  await confirmModal(page);
+  await page.locator('#pill-maint').waitFor({ state: 'hidden' });
+  assert((await page.getAttribute('[data-admin=maint]', 'aria-checked')) === 'false', 'switch shows maintenance off');
+  await logout(page);
+
+  // ---- 3. players
+  log('alice + bob sign up; carol (created during maintenance) logs in and gets her stack');
+  await visible(page, '#auth');
   await signUp(page, 'alice');
   assert((await balance(page)) === 500, 'alice starts with 500');
   await logout(page);
   await authAs(page, 'signup', 'ALICE', 'secret123');
-  await page.locator('#auth-error').waitFor({ state: 'visible' });
-  assert((await page.textContent('#auth-error')).includes('already taken'), 'duplicate username (case-insens.) should be rejected');
+  await page.waitForFunction(() => /taken/i.test(document.getElementById('auth-error').textContent));
   await authAs(page, 'signup', '<img src=x onerror=alert(1)>', 'secret123');
-  assert(await page.locator('#auth-error').isVisible(), 'XSS-looking username should be rejected');
-  await authAs(page, 'signin', 'alice', 'wrongpass');
-  await page.waitForFunction(() => /Invalid username or password/.test(document.getElementById('auth-error').textContent));
-  assert(await page.locator('#app').isHidden(), 'wrong password must not log in');
-  await authAs(page, 'signup', 'bob', 'secret123');
-  await page.locator('#app').waitFor({ state: 'visible' });
-  await page.waitForFunction(() => document.getElementById('h-user').textContent === 'bob');
+  await page.locator('#auth-error').waitFor({ state: 'visible' });
+  await signUp(page, 'bob');
   await logout(page);
-  await login(page, 'alice');
+  await login(page, 'carol');
+  await waitBalance(page, 500);
+  await logout(page);
 
-  // ---- 2. house markets
-  log('daily house markets incl. Trump');
+  // ---- 4. house markets + oracle markets
+  await login(page, 'alice');
+  log('daily house markets: featured Trump market + oracle markets');
   await filter(page, 'open');
-  await card(page, TRUMP).waitFor();
-  const houseCount = await page.locator('#panel-markets article.market.today').count();
-  assert(houseCount === 5, `expected 5 house markets for today (1 featured + 4), got ${houseCount}`);
+  await page.locator('#panel-markets .featured article.mcard').first().waitFor();
+  const houseCount = await page.locator('#panel-markets .featured article.mcard').count();
+  assert(houseCount >= 3, `expected today's house markets in the featured strip, got ${houseCount}`);
+  assert(await page.locator('#panel-markets .featured .badge', { hasText: 'Featured' }).count() === 1, 'one featured market');
+  const oracleCards = page.locator('#panel-markets article.mcard', { has: page.locator('.badge', { hasText: 'Auto-checked' }) });
+  const oracleCount = await oracleCards.count();
+  assert(oracleCount >= 1, 'at least one auto-checked (oracle) market');
+  assert(await page.locator('#panel-markets .badge', { hasText: 'Tampered' }).count() === 0, 'no tampered badges on genuine house markets');
   await shot(page, 'markets-375.png');
+  await shot(page, 'markets-375-full.png', true);
 
-  // ---- 3. custom pool market
-  log('custom choice market: bets, permissions, payout');
-  await createChoice(page, 'Who wins the chess game?', ['Alice', 'Bob'], 'Best of one.');
-  const chess = card(page, 'Who wins the chess game?');
-  await chess.waitFor();
-  assert(await chess.locator('.resolve').count() === 1, 'creator sees resolve controls');
-  await bet(page, chess, 'Alice', 100);
-  await waitBalance(page, 400);
+  // tamper detection: edit a house market in storage -> ⚠ badge + betting disabled
+  log('tampered house market shows ⚠ and disables betting');
+  const tamperedTitle = await page.evaluate(() => {
+    const db = JSON.parse(localStorage.getItem('sonnetous:v2'));
+    const m = Object.values(db.markets).find((x) => x.createdBy === 'house' && !x.oracle && x.templateId !== 'trump-constitution');
+    const k = Object.keys(m.oddsById)[0];
+    m.oddsById[k] = 19.5;
+    m.options.find((o) => o.id === k).odds = 19.5;
+    localStorage.setItem('sonnetous:v2', JSON.stringify(db));
+    return m.title;
+  });
+  await goto(page);
+  await waitUser(page, 'alice');
+  await card(page, tamperedTitle).locator('.badge', { hasText: 'Tampered' }).waitFor();
+  await openMarket(page, tamperedTitle);
+  assert(await sheet(page).locator('[data-slip]').count() === 0, 'no bet slip on a tampered market');
+  assert((await sheet(page).textContent()).includes("doesn't match its template"), 'tamper notice');
+  await closeSheet(page);
+
+  // oracle market: alice bets on the quickest bucket, then USGS reports a quake -> auto-report
+  log('oracle (quake) market: bet, data arrives, client auto-reports');
+  const quakeMarket = await page.evaluate(() => {
+    const db = JSON.parse(localStorage.getItem('sonnetous:v2'));
+    const ms = Object.values(db.markets).filter((x) => x.oracle && x.oracle.type === 'quake' && x.status === 'open')
+      .sort((a, b) => a.oracle.params.minMag - b.oracle.params.minMag);
+    return ms[0] ? { id: ms[0].id, title: ms[0].title, minMag: ms[0].oracle.params.minMag, openedAt: ms[0].openedAt, first: ms[0].options[0].label } : null;
+  });
+  assert(quakeMarket, 'a quake oracle market exists (only keyless oracle templates can build under the stubbed APIs)');
+  await openMarket(page, quakeMarket.title);
+  assert((await sheet(page).locator('#sheet-head').textContent()).includes('Auto-checked'), 'oracle badge in the sheet header');
+  assert((await sheet(page).textContent()).includes('Clock starts when you bet'), 'timer copy in the bet slip');
+  await placeBet(page, quakeMarket.first, 40);
+  await waitBalance(page, 460);
+  await shot(page, 'oracle-market-375.png');
+  await closeSheet(page);
+  await setOffset(page, 30 * MIN);
+  quake.mag = quakeMarket.minMag + 0.3;
+  quake.time = fakeNow() - 2 * MIN;
+  await goto(page); // sweep runs on load
+  await waitUser(page, 'alice');
+  await toastWait(page, 'Auto-reported');
+  await waitBalance(page, 440); // 460 - 20 bond
+  // USGS "revises" the origin time -> the report no longer matches the data
+  quake.time = quakeMarket.openedAt + MIN;
+  await goto(page);
+  await waitUser(page, 'alice');
+  await filter(page, 'disputed');
+  await openMarket(page, quakeMarket.title);
+  await sheet(page).locator('.oracle-alert').waitFor();
+  assert((await sheet(page).locator('.oracle-alert').textContent()).includes("Report doesn't match USGS data"), 'mismatch banner');
+  await shot(page, 'oracle-mismatch-375.png');
+  await closeSheet(page);
+  await logout(page);
+  await login(page, 'bob');
+  await toastWait(page, 'Auto-challenged');
+  await waitBalance(page, 480); // bond
+  await logout(page);
+
+  // ---- 5. custom pool market lifecycle: bet → report w/ evidence → challenge → jury vote → finalize → claims
+  await login(page, 'alice');
+  log('alice creates a pool market; alice and bob bet');
+  const CHESS = 'Who wins Friday’s chess grudge match?';
+  await createChoice(page, CHESS, ['Alice', 'Bob'], 'Counts if: the game is finished over the board. Resignation counts as a loss.');
+  await filter(page, 'open');
+  await openMarket(page, CHESS);
+  assert(await sheet(page).locator('[data-act=void]').count() === 1, 'creator can void before any bet');
+  await placeBet(page, 'Alice', 100);
+  await waitBalance(page, 340);
+  assert(await sheet(page).locator('[data-act=void]').count() === 0, 'void disappears after the first bet');
   await logout(page);
   await login(page, 'bob');
   await filter(page, 'open');
-  const bchess = card(page, 'Who wins the chess game?');
-  await bchess.waitFor();
-  assert(await bchess.locator('.resolve').count() === 0, 'bob must NOT see resolve controls on alice\'s market');
-  assert(await bchess.locator('[data-action=void]').count() === 0, 'bob must NOT see void');
-  assert(await card(page, TRUMP).locator('.resolve').count() === 1, 'anyone can resolve house markets');
-  await bet(page, bchess, 'Bob', 300);
-  await waitBalance(page, 200);
+  await openMarket(page, CHESS);
+  await placeBet(page, 'Bob', 300);
+  await waitBalance(page, 180);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await shot(page, 'sheet-betslip-375.png');
+  assert(await sheet(page).locator('[data-report]').count() === 0, 'bob cannot report alice’s market');
+  await closeSheet(page);
   await logout(page);
+
+  log('betting closes; alice reports with evidence (bond)');
   await login(page, 'alice');
-  await filter(page, 'open');
-  const achess = card(page, 'Who wins the chess game?');
-  await achess.locator('select[data-role=winner]').selectOption({ label: 'Alice' });
-  await achess.locator('[data-action=resolve-choice]').click();
-  await page.locator('.toast-success', { hasText: 'Market settled' }).last().waitFor();
-  await waitBalance(page, 800); // 400 + floor(100 * 400 / 100)
+  await setOffset(page, 30 * MIN + 2 * HOUR);
+  await filter(page, 'needs');
+  await openMarket(page, CHESS);
+  const rep = sheet(page).locator('[data-report]');
+  await rep.locator('.radio-card', { hasText: 'Alice' }).click();
+  assert(await rep.locator('[data-act=report]').isDisabled(), 'evidence link is required for non-oracle markets');
+  assert((await rep.locator('[data-hint]').textContent()).toLowerCase().includes('evidence'), 'inline evidence hint');
+  await rep.locator('[data-key=evidence]').fill('https://example.com/chess-result?x="<b>"');
+  await rep.locator('[data-act=report]').click();
+  await toastWait(page, 'Result reported');
+  await waitBalance(page, 320);
+  await logout(page);
+
+  log('bob sees the report and challenges it');
+  await login(page, 'bob');
+  await filter(page, 'disputed');
+  await openMarket(page, CHESS);
+  const ev = sheet(page).locator('a.evidence-link');
+  assert((await ev.getAttribute('rel')).includes('noopener'), 'evidence link has rel=noopener');
+  await shot(page, 'reported-challenge-375.png');
+  await sheet(page).locator('[data-act=challenge]').first().click();
+  await confirmModal(page);
+  await toastWait(page, 'Challenge filed');
+  await waitBalance(page, 160);
+  assert((await sheet(page).locator('[data-sec=phase]').textContent()).includes("You bet on this market") || (await sheet(page).locator('[data-sec=phase]').textContent()).includes("part of this dispute"), 'bob cannot vote');
+  await logout(page);
+
+  log('carol (no bet) votes to uphold');
+  await login(page, 'carol');
+  await filter(page, 'disputed');
+  await openMarket(page, CHESS);
+  await sheet(page).locator('[data-act=vote-up]').waitFor();
+  await shot(page, 'disputed-voting-375.png');
+  await sheet(page).locator('[data-act=vote-up]').click();
+  await toastWait(page, 'Vote cast');
+  await page.waitForFunction(() => /already voted/.test(document.querySelector('#sheet [data-sec=phase]').textContent));
+  assert((await sheet(page).locator('.tally-legend').textContent()).includes('Uphold · 1'), 'tally updated');
+  await closeSheet(page);
+  await logout(page);
+
+  log('24h later: finalize + automatic claims (alice wins the pool + challenger bond)');
+  await login(page, 'alice');
+  await setOffset(page, 30 * MIN + 2 * HOUR + 25 * HOUR);
+  await goto(page); // housekeeping on login
+  await waitUser(page, 'alice');
+  // 320 + pool 400 + bond 40 (+ quake bet/bond settle depending on jury: quake market was challenged with no votes -> void)
+  await page.waitForFunction(() => {
+    const db = JSON.parse(localStorage.getItem('sonnetous:v2'));
+    return Object.values(db.markets).filter((m) => m.title === 'Who wins Friday’s chess grudge match?').every((m) => m.status === 'resolved');
+  }, null, { timeout: 8000 });
+  await toastWait(page, 'You won', 'win');
+  // chess: +400 pool, +40 bond; quake: void (no votes) -> +40 stake refund, +20 bond refund
+  await waitBalance(page, 320 + 400 + 40 + 40 + 20);
   await filter(page, 'settled');
-  const settled = card(page, 'Who wins the chess game?');
-  await settled.waitFor();
-  assert((await settled.textContent()).includes('+§300'), 'settled card shows alice net +§300');
-  await shot(page, 'settled-375.png');
-  await tab(page, 'leaderboard');
-  const lb = await page.textContent('#panel-leaderboard');
-  assert(lb.includes('§800') && lb.includes('§200'), 'leaderboard shows 800 / 200');
-  const names = await page.locator('#panel-leaderboard tbody tr .name').allTextContents();
-  assert(names[0].startsWith('alice'), 'alice ranks first');
-
-  // ---- 4. void & refund
-  log('void & refund');
-  await createChoice(page, 'Will it rain on Friday?', ['Yes', 'No']);
-  await bet(page, card(page, 'Will it rain on Friday?'), 'Yes', 150);
-  await waitBalance(page, 650);
-  await logout(page);
-  await login(page, 'bob');
-  await filter(page, 'open');
-  await bet(page, card(page, 'Will it rain on Friday?'), 'No', 50);
-  await waitBalance(page, 150);
-  await logout(page);
-  await login(page, 'alice');
-  await filter(page, 'open');
-  await card(page, 'Will it rain on Friday?').locator('[data-action=void]').click();
-  await page.locator('.toast-success', { hasText: 'voided' }).last().waitFor();
-  await waitBalance(page, 800);
+  await openMarket(page, CHESS);
+  assert((await sheet(page).locator('[data-sec=phase]').textContent()).includes('Resolved: Alice'), 'outcome shown');
+  assert((await sheet(page).locator('[data-sec=phase]').textContent()).includes('+§300'), 'your result shown');
+  await closeSheet(page);
   await tab(page, 'mybets');
-  assert((await page.textContent('#panel-mybets')).includes('refunded'), 'my bets shows refunded');
+  assert((await page.textContent('#panel-mybets')).includes('Won'), 'my bets history shows the win');
   await logout(page);
   await login(page, 'bob');
-  await waitBalance(page, 200);
+  await goto(page);
+  await waitUser(page, 'bob');
+  await waitBalance(page, 160 + 20); // lost chess stake + bond; quake challenge tie -> bond back
   await logout(page);
-  await login(page, 'alice');
 
-  // ---- 8. XSS (before it grows more history)
-  log('XSS: title / option / description rendered as text');
+  // ---- 6. XSS
+  log('XSS: title / option / description render as text');
+  await login(page, 'alice');
   const XSS = '<img src=x onerror=alert(1)>';
-  await createChoice(page, XSS, [XSS, '<b>bold</b>'], `desc ${XSS}`);
+  await createChoice(page, XSS, ['<script>alert(2)</script>', 'fine'], '<b onmouseover=alert(3)>desc</b>', '86400000');
+  await filter(page, 'open');
   const xc = card(page, XSS);
   await xc.waitFor();
-  assert((await xc.locator('.opt').first().textContent()).includes(XSS), 'option label shown as literal text');
-  assert(await page.locator('#panel-markets img[src=x]').count() === 0, 'no injected <img>');
-  assert(await page.locator('#panel-markets b', { hasText: 'bold' }).count() === 0, 'no injected <b>');
-  await bet(page, xc, XSS, 5);
-  for (const t of ['mybets', 'activity', 'leaderboard']) {
-    await tab(page, t);
-    assert(await page.locator('img[src=x]').count() === 0, `no injected <img> on ${t}`);
-  }
-  assert((await page.textContent('#panel-activity')).includes(XSS), 'activity shows literal XSS text');
-  await sleep(300);
-  await waitBalance(page, 795);
-  await xc.waitFor().catch(() => {});
-  await filter(page, 'open');
-  await card(page, XSS).locator('[data-action=void]').click();
-  await page.locator('.toast-success', { hasText: 'voided' }).last().waitFor();
-  await waitBalance(page, 800);
-  noProblems('step 8');
+  assert(await xc.locator('img').count() === 0, 'no <img> injected into the card');
+  assert((await xc.textContent()).includes('<script>alert(2)</script>'), 'option label shown literally');
+  await openMarket(page, XSS);
+  assert(await sheet(page).locator('img, script, b[onmouseover]').count() === 0, 'nothing injected into the sheet');
+  assert((await sheet(page).textContent()).includes('<b onmouseover=alert(3)>desc</b>'), 'description shown literally');
+  await closeSheet(page);
+  await tab(page, 'activity');
+  assert(await page.locator('#panel-activity img').count() === 0, 'activity feed escapes titles');
 
-  log('long unbroken strings do not cause horizontal scroll');
-  const LONG = 'W'.repeat(140);
-  const LOPT = 'M'.repeat(60);
-  await createChoice(page, LONG, [LOPT, LOPT.slice(1) + 'X'], 'D'.repeat(300));
-  await bet(page, card(page, LONG), LOPT, 5);
-  await noHScroll(page, 'long strings 375');
+  // ---- 7. inputs survive live re-renders
+  log('typed bet amount survives a live update from another tab');
   await filter(page, 'open');
-  await card(page, LONG).locator('[data-action=void]').click();
-  await page.locator('.toast-success', { hasText: 'voided' }).last().waitFor();
-  await waitBalance(page, 800);
-
-  // ---- 9. multi-tab: typing is not wiped by another tab's bet
-  log('second tab places a bet while first tab is typing');
-  await createChoice(page, 'Typing test market', ['One', 'Two']);
-  await createChoice(page, 'Other market', ['Left', 'Right']);
-  await filter(page, 'open');
-  const page2 = await newPage(ctx, 'tab2');
-  await goto(page2);
-  await page2.locator('#app').waitFor({ state: 'visible' });
-  await filter(page2, 'open');
-  const tc = card(page, 'Typing test market');
-  await tc.locator('.opt', { hasText: 'One' }).click();
-  const inp = tc.locator('[data-role=amount]');
-  await inp.click();
-  await inp.pressSequentially('1');
-  await bet(page2, card(page2, 'Other market'), 'Left', 25); // page2 storage write -> page1 storage event
-  await waitBalance(page, 775);
-  await sleep(500);
-  await inp.pressSequentially('2');
-  assert((await inp.inputValue()) === '12', `typed amount was wiped, got "${await inp.inputValue()}"`);
-  assert(await inp.evaluate((el) => el === document.activeElement), 'amount input lost focus');
-  await page.click('#app .brand'); // blur -> catch-up render must keep the draft
-  await sleep(500);
-  assert((await card(page, 'Typing test market').locator('[data-role=amount]').inputValue()) === '12', 'draft lost after blur re-render');
-  // negative / fractional / over-balance amounts are rejected in the UI
-  const tin = card(page, 'Typing test market').locator('[data-role=amount]');
-  for (const bad of ['-5', '1.5', '999999', '0']) {
-    await tin.fill(bad);
-    assert(await card(page, 'Typing test market').locator('[data-action=bet]').isDisabled(), `place bet must be disabled for "${bad}"`);
-  }
-  await page2.close();
-  // void the helper markets so the balance is back to 800
-  await filter(page, 'open');
-  for (const t of ['Typing test market', 'Other market']) {
-    await card(page, t).locator('[data-action=void]').click();
-    await page.locator('.toast-success', { hasText: 'voided' }).last().waitFor();
-  }
-  await waitBalance(page, 800);
-  noProblems('step 9');
-
-  // ---- 5. timer market
-  log('timer market: bet, then "It happened!" two days later');
-  await filter(page, 'open');
-  await bet(page, card(page, TRUMP), 'Within 1 day', 50);
-  await waitBalance(page, 750);
-  await logout(page);
-  await login(page, 'bob');
-  await filter(page, 'open');
-  await bet(page, card(page, TRUMP), '1–4 days', 100);
-  await waitBalance(page, 100);
-  await logout(page);
-  await login(page, 'alice');
-  await setOffset(page, 2 * DAY);
-  await goto(page);
-  await filter(page, 'awaiting');
-  const tr = card(page, TRUMP);
-  await tr.waitFor();
-  assert((await tr.textContent()).includes('Awaiting result'), 'Trump day-0 market awaits result');
-  await tr.locator('[data-action=resolve-timer]').click();
-  await page.locator('.toast-success', { hasText: 'Market settled' }).last().waitFor();
-  await waitBalance(page, 750); // alice lost her 50 on "Within 1 day"
-  await filter(page, 'settled');
-  const trs = card(page, TRUMP).first();
-  assert((await trs.textContent()).includes('1–4 days'), 'winning bucket is 1–4 days');
-  await logout(page);
-  await login(page, 'bob');
-  await waitBalance(page, 400); // 100 + floor(100 * 3)
-  await logout(page);
-
-  // ---- 6. bankruptcy
-  log('bankruptcy: all-in loss, broke banner, next day bailout, penalty tax');
-  await signUp(page, 'dave');
-  await filter(page, 'open');
-  const x = card(page, TRUMP);
-  await x.waitFor();
-  await bet(page, x, '8+ days', 500);
-  await waitBalance(page, 0);
-  await card(page, TRUMP).locator('[data-action=resolve-timer]').click();
-  await page.locator('.toast-success', { hasText: 'Market settled' }).last().waitFor();
-  await page.locator('#banner .banner-broke').waitFor();
-  const bannerTxt = await page.textContent('#banner');
-  assert(/Come back tomorrow/.test(bannerTxt), 'broke banner says come back tomorrow');
-  assert(await page.locator('[data-action=claim]').count() === 0, 'no claim button on the day you went broke');
-  await shot(page, 'broke-375.png');
-  await setOffset(page, 3 * DAY);
-  await goto(page);
-  await page.locator('[data-action=claim]').waitFor();
-  assert(/Claim §100 bailout/.test(await page.textContent('[data-action=claim]')), 'claim button label');
-  await shot(page, 'bailout-375.png');
-  await page.click('[data-action=claim]');
-  await waitBalance(page, 100);
-  assert((await page.textContent('#h-skulls')) === '💀×1', 'header shows 💀×1');
-  await page.waitForFunction(() => !document.getElementById('h-penalty').hidden);
-  const pen = await page.textContent('#h-penalty');
-  assert(/left/.test(pen) && /(2d 2\dh|3d 0h)/.test(pen), `penalty badge with time left, got "${pen}"`);
-  assert(await page.locator('#banner .banner-broke').count() === 0, 'broke banner gone after claim');
-  await tab(page, 'leaderboard');
-  const daveRow = page.locator('#panel-leaderboard tbody tr', { hasText: 'dave' });
-  assert((await daveRow.textContent()).includes('💀×1'), 'leaderboard shows 💀×1 for dave');
-  await shot(page, 'leaderboard-375.png');
-  await noHScroll(page, 'dave with skull + tax badge 375');
-  await filter(page, 'open');
-  const y = card(page, TRUMP);
-  await bet(page, y, 'Within 1 day', 100);
-  await waitBalance(page, 0);
-  await card(page, TRUMP).locator('[data-action=resolve-timer]').click();
-  await page.locator('.toast-success', { hasText: 'Market settled' }).last().waitFor();
-  await waitBalance(page, 475); // profit 500 - 25% tax (125) + stake 100
-  await tab(page, 'mybets');
-  const mb = await page.textContent('#panel-mybets');
-  assert(/tax\s*[−-]§125/.test(mb), 'My Bets shows the §125 tax');
-  assert(/Bankruptcy tax paid so far: §125/.test(mb), 'My Bets tax total');
-  await shot(page, 'mybets-tax-375.png');
-  await logout(page);
-  await login(page, 'alice');
-
-  // ---- 7. auto-resolve
-  log('auto-resolve to the open-ended bucket after 8 days');
-  await tab(page, 'create');
-  await page.fill('#panel-create [name=title]', 'How long till Bob pays me back?');
-  await page.check('#panel-create [name=kind][value=timer]');
-  await page.click('#panel-create [type=submit]');
-  await page.locator('.toast-success', { hasText: 'Market created' }).last().waitFor();
-  await filter(page, 'open');
-  const z = card(page, 'How long till Bob pays me back?');
-  await bet(page, z, '8+ days', 100);
-  await waitBalance(page, 650);
-  const aliceBefore = 650;
-  await setOffset(page, 3 * DAY + 9 * DAY);
-  await goto(page);
-  await filter(page, 'settled');
-  const zs = card(page, 'How long till Bob pays me back?');
-  await zs.waitFor();
-  assert((await zs.textContent()).includes('auto-settled'), 'resolved by auto');
-  assert(await zs.locator('.opt.winner', { hasText: '8+ days' }).count() === 1, '8+ days bucket wins');
-  await waitBalance(page, aliceBefore + 130);
-
-  // ---- 10. countdown ticks & closesAt passing
-  log('countdown ticks; market moves to Awaiting when closesAt passes');
-  await tab(page, 'create');
-  await page.fill('#panel-create [name=title]', 'Closing very soon');
-  const inOneMinute = await page.evaluate(() => {
-    const d = new Date(Date.now() + 100_000); const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  await openMarket(page, XSS);
+  await sheet(page).locator('[data-pick]').first().click();
+  await sheet(page).locator('[data-key=amount]').fill('77');
+  await page.evaluate(() => { // another tab places a bet -> storage event -> re-render
+    const db = JSON.parse(localStorage.getItem('sonnetous:v2'));
+    const m = Object.values(db.markets).find((x) => x.title.startsWith('<img'));
+    m.totalPool += 5; m.optionTotals.o2 = (m.optionTotals.o2 || 0) + 5; m.betCount += 1;
+    localStorage.setItem('sonnetous:v2', JSON.stringify(db));
+    window.dispatchEvent(new StorageEvent('storage', { key: 'sonnetous:v2' }));
   });
-  await page.fill('#panel-create [name=closesAt]', inOneMinute);
-  const labels = page.locator('#panel-create [data-role=label]');
-  await labels.nth(0).fill('Yes');
-  await labels.nth(1).fill('No');
-  await page.click('#panel-create [type=submit]');
-  await page.locator('.toast-success', { hasText: 'Market created' }).last().waitFor();
-  await filter(page, 'open');
-  const cs = card(page, 'Closing very soon');
-  const cd = cs.locator('[data-countdown]').first();
-  const t1 = await cd.textContent();
-  await sleep(2200);
-  const t2 = await cd.textContent();
-  assert(t1 !== t2, `countdown should tick (${t1} -> ${t2})`);
-  const openBefore = parseInt(await page.locator('[data-filter=open] .count').textContent(), 10);
-  await setOffset(page, 3 * DAY + 9 * DAY + 5 * 60_000);
-  await page.waitForFunction(() => !document.querySelector('#panel-markets article h3')
-    || ![...document.querySelectorAll('#panel-markets article h3')].some((h) => h.textContent === 'Closing very soon'),
-  null, { timeout: 5000 });
-  const openAfter = parseInt(await page.locator('[data-filter=open] .count').textContent(), 10);
-  assert(openAfter === openBefore - 1, 'open count dropped by one');
-  await filter(page, 'awaiting');
-  assert((await card(page, 'Closing very soon').textContent()).includes('Awaiting result'), 'market now awaiting');
-  assert(await card(page, 'Closing very soon').locator('[data-action=bet]').count() === 0, 'no betting on closed market');
+  await sleep(300);
+  assert((await sheet(page).locator('[data-key=amount]').inputValue()) === '77', 'amount preserved across re-render');
+  await closeSheet(page);
 
-  // ---- 9b. layout + errors
-  log('no horizontal scroll at 375px, no console errors');
+  // ---- 8. leaderboard
+  log('leaderboard ranks by net worth and highlights you');
+  await tab(page, 'leaderboard');
+  const lb = page.locator('#panel-leaderboard .lb-row');
+  assert((await lb.first().textContent()).includes('alice'), 'alice ranks first');
+  assert(await page.locator('#panel-leaderboard .lb-row.is-me').count() === 1, 'you are highlighted');
+  await shot(page, 'leaderboard-375.png', true);
+
+  log('no horizontal overflow at 375px');
   await noHScroll(page, 'alice 375');
-  noProblems('end of mobile run');
-
-  // ---- stale state after user switch
-  log('no stale drafts / create form after switching user');
-  await tab(page, 'create');
-  await page.fill('#panel-create [name=title]', 'half-typed draft');
+  await filter(page, 'settled');
+  await openMarket(page, CHESS);
+  const sheetOver = await page.evaluate(() => {
+    const p = document.querySelector('#sheet .sheet-panel');
+    return p.scrollWidth - p.clientWidth;
+  });
+  assert(sheetOver <= 0, `sheet overflows horizontally by ${sheetOver}px`);
+  await closeSheet(page);
   await logout(page);
-  await login(page, 'bob');
-  await tab(page, 'create');
-  assert((await page.inputValue('#panel-create [name=title]')) === '', 'create form must be reset for the next user');
-  await filter(page, 'open');
-  assert((await page.locator('#panel-markets article').first().locator('[data-role=amount]').inputValue()) === '', 'no stale bet draft');
 
-  // another tab switching the (shared) session must not leak this tab's drafts
-  log('session switched from another tab');
+  // ---- 9. ban / unban
+  log('admin bans carol -> banned screen with reason -> unban');
+  await login(page, 'boss');
+  await page.click('#btn-profile');
+  await page.click('#profile [data-go=admin]');
+  await visible(page, '#panel-admin');
+  await page.locator('[data-admin=ban][data-name=carol]').click();
+  await visible(page, '#modal-input');
+  await page.click('#modal [data-m=ok]'); // empty reason -> inline error
+  await visible(page, '#modal-err');
+  await page.fill('#modal-input', 'Voting <i>twice</i>');
+  await page.click('#modal [data-m=ok]');
+  await toastWait(page, 'has been banned');
+  await page.locator('#panel-admin .ban-item', { hasText: 'carol' }).waitFor();
+  await shot(page, 'admin-375.png', true);
+  await noHScroll(page, 'admin 375');
   await logout(page);
+  await authAs(page, 'signin', 'carol', 'secret123');
+  await visible(page, '#gate');
+  await page.waitForFunction(() => /banned/.test(document.getElementById('gate').textContent));
+  assert((await page.textContent('#ban-reason')) === 'Voting <i>twice</i>', 'ban reason rendered as text');
+  assert(await page.locator('#gate i').count() === 0, 'ban reason not injected');
+  await shot(page, 'banned-375.png');
+  await page.click('[data-gate-logout]');
+  await login(page, 'boss');
+  await page.click('#btn-profile');
+  await page.click('#profile [data-go=admin]');
+  await page.locator('#panel-admin .ban-item [data-admin=unban]').first().click();
+  await confirmModal(page);
+  await toastWait(page, 'back in the game');
+  await logout(page);
+  await login(page, 'carol');
+  await logout(page);
+
+  // ---- 10. desktop
+  log('desktop layout screenshots (1280px)');
+  await page.setViewportSize({ width: 1280, height: 900 });
   await login(page, 'alice');
   await filter(page, 'open');
-  const dc = page.locator('#panel-markets article.market').first();
-  await dc.locator('.opt').first().click();
-  await dc.locator('[data-role=amount]').fill('7');
-  const p3 = await newPage(ctx, 'tab3');
-  await goto(p3);
-  await logout(p3);
-  await page.locator('#auth').waitFor({ state: 'visible' });
-  await login(p3, 'bob');
-  await page.waitForFunction(() => document.getElementById('h-user').textContent === 'bob');
-  await filter(page, 'open');
-  assert((await page.locator('#panel-markets article.market').first().locator('[data-role=amount]').inputValue()) === '', 'draft leaked to another user after session switch');
-  assert(await page.locator('#panel-markets article.market .opt.selected').count() === 0, 'option selection leaked to another user');
-  await p3.close();
-  noProblems('session switch');
-  await ctx.close();
+  await shot(page, 'markets-1280.png');
+  await openMarket(page, XSS);
+  await sheet(page).locator('[data-pick]').first().click();
+  await sheet(page).locator('[data-key=amount]').fill('50');
+  await shot(page, 'sheet-betslip-1280.png');
+  await closeSheet(page);
+  await tab(page, 'leaderboard');
+  await shot(page, 'leaderboard-1280.png');
+  await tab(page, 'mybets');
+  await shot(page, 'mybets-1280.png');
+  await tab(page, 'activity');
+  await shot(page, 'activity-1280.png');
+  await tab(page, 'create');
+  await page.fill('#c-title', 'Will the group chat survive another election?');
+  await shot(page, 'create-1280.png');
+  await page.fill('#c-title', '');
+  await logout(page);
+  await login(page, 'boss');
+  await tab(page, 'admin');
+  await shot(page, 'admin-1280.png');
+  await logout(page);
+  await visible(page, '#auth');
+  await shot(page, 'auth-1280.png');
 
-  // ============================================================ desktop run
-  log('desktop viewport sanity');
-  const dctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  await forceLocalMode(dctx);
-  await dctx.addInitScript(INIT);
-  const dp = await newPage(dctx, 'desktop');
-  current = dp;
-  await goto(dp);
-  await signUp(dp, 'carol');
-  await filter(dp, 'open');
-  await card(dp, TRUMP).waitFor();
-  await bet(dp, card(dp, TRUMP), '1–4 days', 40);
-  await waitBalance(dp, 460);
-  await noHScroll(dp, 'carol 1280');
-  await shot(dp, 'markets-desktop.png');
-  noProblems('desktop run');
-  await dctx.close();
-
+  noProblems('the end');
   console.log(`\nSMOKE OK — screenshots in ${SHOTS}`);
 } catch (err) {
   console.error('\nSMOKE FAILED:', err.message);
-  if (problems.length) console.error('Collected problems:\n  ' + problems.join('\n  '));
-  if (current) { try { await shot(current, 'FAIL.png', true); console.error('Failure screenshot:', path.join(SHOTS, 'FAIL.png')); } catch { /* ignore */ } }
+  if (problems.length) console.error('problems:\n  ' + problems.join('\n  '));
+  if (current) await current.screenshot({ path: path.join(SHOTS, 'FAILED.png'), fullPage: true }).catch(() => {});
   process.exitCode = 1;
 } finally {
   await browser.close();
